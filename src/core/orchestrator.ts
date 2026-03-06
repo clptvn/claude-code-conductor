@@ -27,6 +27,7 @@ import type {
   ProviderUsageMonitor,
   UsageSnapshot,
   WorkerRuntime,
+  ProjectProfile,
 } from "../utils/types.js";
 
 import {
@@ -60,6 +61,28 @@ import { extractConventions } from "../utils/conventions-extractor.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
 import { runSemgrep } from "../utils/semgrep-runner.js";
 import { loadKnownIssues, addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
+import {
+  detectProject,
+  loadCachedProfile,
+  cacheProfile,
+  formatProjectGuidance,
+} from "./project-detector.js";
+import {
+  EventLog,
+  recordPhaseStart,
+  recordPhaseEnd,
+  recordWorkerSpawn,
+  recordWorkerComplete,
+  recordWorkerFail,
+  recordWorkerTimeout,
+  recordTaskClaimed,
+  recordTaskCompleted,
+  recordTaskFailed,
+  recordTaskRetried,
+  recordReviewVerdict,
+  recordUsageWarning,
+  recordProjectDetection,
+} from "./event-log.js";
 
 // ============================================================
 // Helpers
@@ -100,6 +123,9 @@ export class Orchestrator {
   private conventions: ProjectConventions | null = null;
   private projectRules: string = "";
   private threatModel: ThreatModel | null = null;
+
+  // V2: Auto-detected project profile
+  private projectProfile: ProjectProfile | null = null;
 
   // Stores any user redirect guidance gathered during escalation
   private redirectGuidance: string | null = null;
@@ -291,6 +317,10 @@ export class Orchestrator {
           featureDescription: this.options.feature,
           threatModelSummary: this.threatModel
             ? this.formatThreatModelForWorkers(this.threatModel)
+            : undefined,
+          // V2: Auto-detected project guidance
+          projectGuidance: this.projectProfile
+            ? formatProjectGuidance(this.projectProfile)
             : undefined,
         });
 
@@ -514,6 +544,16 @@ export class Orchestrator {
       await this.ensureExecutionRuntimeAvailable();
       await this.clearPauseSignalIfPresent(this.options.forceResume ? "force-resume" : "resume");
 
+      // V2: Load cached project profile on resume
+      try {
+        this.projectProfile = await loadCachedProfile(this.options.project);
+        if (this.projectProfile) {
+          this.logger.info(`Loaded cached project profile from ${this.projectProfile.detected_at}`);
+        }
+      } catch (err) {
+        this.logger.warn(`Failed to load cached project profile: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
       if (!this.options.skipCodex) {
         await this.setupCodexMcpConfig();
       }
@@ -591,6 +631,30 @@ export class Orchestrator {
     }
 
     await this.ensureExecutionRuntimeAvailable();
+
+    // V2: Project auto-detection
+    await this.state.setProgress("Initializing: detecting project configuration...");
+    await logProgress(this.options.project, "initializing", "Detecting project configuration");
+
+    try {
+      // Try to load cached profile first
+      this.projectProfile = await loadCachedProfile(this.options.project);
+
+      if (!this.projectProfile) {
+        // No cache - run detection
+        this.logger.info("Running project auto-detection...");
+        this.projectProfile = await detectProject(this.options.project);
+        await cacheProfile(this.options.project, this.projectProfile);
+        this.logger.info(
+          `Detected: ${this.projectProfile.languages.join(", ")} project with ${this.projectProfile.frameworks.join(", ") || "no frameworks"}`
+        );
+      } else {
+        this.logger.info(`Loaded cached project profile from ${this.projectProfile.detected_at}`);
+      }
+    } catch (err) {
+      this.logger.warn(`Project detection failed: ${err instanceof Error ? err.message : String(err)}`);
+      // Continue without project guidance
+    }
 
     // Print welcome banner
     this.printBanner();

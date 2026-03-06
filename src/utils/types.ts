@@ -322,6 +322,7 @@ export interface WorkerSharedContext {
   projectRules?: string;
   featureDescription?: string;
   threatModelSummary?: string;
+  projectGuidance?: string; // V2: Auto-detected project guidance
 }
 
 /**

@@ -19,6 +19,7 @@ export interface WorkerPromptContext {
   featureDescription?: string;
   threatModelSummary?: string;
   taskType?: TaskType;
+  projectGuidance?: string; // V2: Auto-detected project guidance
 }
 
 export function getWorkerPrompt(context: WorkerPromptContext): string {
@@ -198,6 +199,13 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
     }
 
     lines.push(convLines.join("\n"));
+  }
+
+  // ------------------------------------------------------------------
+  // 5.5. Project Guidance (conditional — V2: auto-detected project info)
+  // ------------------------------------------------------------------
+  if (context.projectGuidance) {
+    lines.push(context.projectGuidance);
   }
 
   // ------------------------------------------------------------------
