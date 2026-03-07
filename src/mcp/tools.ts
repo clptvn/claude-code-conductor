@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { lock, unlock } from "proper-lockfile";
+import { z } from "zod";
 import type {
   Message,
   MessageType,
@@ -25,6 +26,51 @@ import { rankClaimableTasks, type RankedTask } from "../core/task-scheduler.js";
 import { validateFileName, validateFileNames } from "../utils/validation.js";
 
 const execFileAsync = promisify(execFile);
+
+// ============================================================
+// Input Size Limits (#16 - DoS prevention)
+// ============================================================
+
+const MAX_RESULT_SUMMARY_LENGTH = 10_000; // 10K chars
+const MAX_CONTRACT_SPEC_LENGTH = 50_000;  // 50K chars
+const MAX_DECISION_LENGTH = 10_000;       // 10K chars
+const MAX_MESSAGE_CONTENT_LENGTH = 10_000; // 10K chars
+
+// Zod schemas for input validation
+const CompleteTaskInputSchema = z.object({
+  task_id: z.string(),
+  result_summary: z.string().max(MAX_RESULT_SUMMARY_LENGTH, {
+    message: `result_summary exceeds maximum length of ${MAX_RESULT_SUMMARY_LENGTH} characters`,
+  }),
+  files_changed: z.array(z.string()).optional(),
+});
+
+const RegisterContractInputSchema = z.object({
+  contract_id: z.string(),
+  contract_type: z.enum(["api_endpoint", "type_definition", "event_schema", "database_schema"]),
+  spec: z.string().max(MAX_CONTRACT_SPEC_LENGTH, {
+    message: `spec exceeds maximum length of ${MAX_CONTRACT_SPEC_LENGTH} characters`,
+  }),
+});
+
+const RecordDecisionInputSchema = z.object({
+  category: z.string(),
+  decision: z.string().max(MAX_DECISION_LENGTH, {
+    message: `decision exceeds maximum length of ${MAX_DECISION_LENGTH} characters`,
+  }),
+  rationale: z.string().max(MAX_DECISION_LENGTH, {
+    message: `rationale exceeds maximum length of ${MAX_DECISION_LENGTH} characters`,
+  }),
+  task_id: z.string().optional(),
+});
+
+const PostUpdateInputSchema = z.object({
+  type: z.string(),
+  content: z.string().max(MAX_MESSAGE_CONTENT_LENGTH, {
+    message: `content exceeds maximum length of ${MAX_MESSAGE_CONTENT_LENGTH} characters`,
+  }),
+  to: z.string().optional(),
+});
 
 // ============================================================
 // Environment helpers
@@ -189,7 +235,13 @@ export interface PostUpdateInput {
 
 export async function handlePostUpdate(
   input: PostUpdateInput
-): Promise<Message> {
+): Promise<Message | { error: string }> {
+  // Validate input size limits (#16 - DoS prevention)
+  const sizeValidation = PostUpdateInputSchema.safeParse(input);
+  if (!sizeValidation.success) {
+    return { error: sizeValidation.error.errors.map(e => e.message).join("; ") };
+  }
+
   const dir = messagesDir();
   await ensureDir(dir);
 
@@ -450,6 +502,15 @@ export interface CompleteTaskResult {
 export async function handleCompleteTask(
   input: CompleteTaskInput
 ): Promise<CompleteTaskResult> {
+  // Validate input size limits (#16 - DoS prevention)
+  const sizeValidation = CompleteTaskInputSchema.safeParse(input);
+  if (!sizeValidation.success) {
+    return {
+      success: false,
+      error: sizeValidation.error.errors.map(e => e.message).join("; "),
+    };
+  }
+
   // Validate files_changed entries to prevent path traversal (#14)
   if (input.files_changed && input.files_changed.length > 0) {
     const failures = validateFileNames(input.files_changed);
@@ -582,6 +643,12 @@ export interface RegisterContractInput {
 export async function handleRegisterContract(
   input: RegisterContractInput
 ): Promise<ContractSpec | { error: string }> {
+  // Validate input size limits (#16 - DoS prevention)
+  const sizeValidation = RegisterContractInputSchema.safeParse(input);
+  if (!sizeValidation.success) {
+    return { error: sizeValidation.error.errors.map(e => e.message).join("; ") };
+  }
+
   // Validate contract_id to prevent path traversal (#14)
   const validation = validateFileName(input.contract_id);
   if (!validation.valid) {
@@ -664,7 +731,13 @@ export interface RecordDecisionInput {
 
 export async function handleRecordDecision(
   input: RecordDecisionInput
-): Promise<ArchitecturalDecision> {
+): Promise<ArchitecturalDecision | { error: string }> {
+  // Validate input size limits (#16 - DoS prevention)
+  const sizeValidation = RecordDecisionInputSchema.safeParse(input);
+  if (!sizeValidation.success) {
+    return { error: sizeValidation.error.errors.map(e => e.message).join("; ") };
+  }
+
   const filePath = decisionsPath();
   await ensureDir(path.dirname(filePath));
 
