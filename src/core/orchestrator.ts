@@ -11,6 +11,7 @@ import { logProgress } from "../utils/progress.js";
 import type {
   CLIOptions,
   ExecutionWorkerManager,
+  CodexReviewResult,
   CycleRecord,
   PhaseDurations,
   BlastRadius,
@@ -39,10 +40,12 @@ import {
   MAX_PLAN_DISCUSSION_ROUNDS,
   MAX_CODE_REVIEW_ROUNDS,
   MAX_DISAGREEMENT_ROUNDS,
+  CODEX_RATE_LIMIT_BACKOFF_MS,
   DEFAULT_WORKER_POLL_INTERVAL_MS,
   WIND_DOWN_GRACE_PERIOD_MS,
   DEFAULT_WORKER_TIMEOUT_MS,
   GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+  USAGE_STALE_CRITICAL_MS,
   getTasksDraftPath,
 } from "../utils/constants.js";
 
@@ -167,7 +170,7 @@ export class Orchestrator {
     const __dirname = path.dirname(__filename);
     const mcpServerPath = path.join(__dirname, "..", "mcp", "coordination-server.js");
 
-    this.codex = new CodexReviewer(options.project, this.logger);
+    this.codex = new CodexReviewer(options.project, orchestratorDir, mcpServerPath, this.logger);
     this.planner = new Planner(options.project, this.logger);
 
     this.claudeUsage = new UsageMonitor({
@@ -444,7 +447,7 @@ export class Orchestrator {
           started_at: new Date(cycleStart).toISOString(),
           completed_at: new Date().toISOString(),
           flow_tracing: flowReport
-            ? FlowTracer.toSummary(flowReport, flowReport.summary.total > 0 ? Date.now() - cycleStart : 0)
+            ? FlowTracer.toSummary(flowReport, phaseDurations.flow_tracing_ms ?? 0)
             : undefined,
           phase_durations: phaseDurations,
           blast_radius: blastRadius,
@@ -811,6 +814,28 @@ export class Orchestrator {
     const snapshot = await usageMonitor.poll();
     await this.persistProviderUsage(provider, snapshot);
 
+    // If usage data is critically stale (e.g. API has been 429'ing for 15+ min),
+    // we can't trust the cached thresholds. Safety-pause and wait for recovery.
+    if (usageMonitor.getStaleDurationMs() >= USAGE_STALE_CRITICAL_MS) {
+      const staleMin = Math.round(usageMonitor.getStaleDurationMs() / 60_000);
+      const failures = usageMonitor.getConsecutiveFailures();
+      const detail =
+        `${provider} usage data is critically stale (${staleMin}min, ${failures} consecutive failures) ` +
+        `before ${phase}. Cannot verify capacity — safety-pausing.`;
+      this.logger.warn(detail);
+      await this.handleProviderRateLimit(provider, detail, usageMonitor.getResetTime());
+      return true;
+    }
+
+    // Warn (but don't pause) if data is stale but below critical threshold
+    if (usageMonitor.isDataStale()) {
+      const staleMin = Math.round(usageMonitor.getStaleDurationMs() / 60_000);
+      this.logger.warn(
+        `${provider} usage data is stale (${staleMin}min old, ` +
+        `${usageMonitor.getConsecutiveFailures()} failures) before ${phase}. Proceeding with caution.`
+      );
+    }
+
     if (!usageMonitor.isWindDownNeeded() && !usageMonitor.isCritical()) {
       return true;
     }
@@ -819,8 +844,6 @@ export class Orchestrator {
       `${provider} 5-hour usage is ${(snapshot.five_hour * 100).toFixed(1)}% ` +
       `before ${phase}.`;
     await this.handleProviderRateLimit(provider, detail, usageMonitor.getResetTime());
-    // handleProviderRateLimit now waits for reset and auto-resumes,
-    // so the caller can safely continue.
     return true;
   }
 
@@ -892,13 +915,10 @@ export class Orchestrator {
           return planVersion;
         }
         const planPath = getPlanPath(this.options.project, planVersion);
-        let reviewResult = await this.codex.reviewPlan(planPath);
-
-        // If Codex is rate-limited, wait and retry
-        if (reviewResult.verdict === "RATE_LIMITED") {
-          await this.handleCodexRateLimit(reviewResult.raw_output);
-          reviewResult = await this.codex.reviewPlan(planPath);
-        }
+        let reviewResult = await this.retryCodexWithBackoff(
+          () => this.codex.reviewPlan(planPath),
+          "plan review",
+        );
 
         let discussionRound = 0;
         const issueCounts = new Map<string, number>();
@@ -906,6 +926,7 @@ export class Orchestrator {
         while (
           reviewResult.verdict !== "APPROVE" &&
           reviewResult.verdict !== "ERROR" &&
+          reviewResult.verdict !== "RATE_LIMITED" &&
           discussionRound < MAX_PLAN_DISCUSSION_ROUNDS
         ) {
           discussionRound++;
@@ -996,13 +1017,10 @@ export class Orchestrator {
           if (!canReReviewPlan) {
             return planVersion;
           }
-          reviewResult = await this.codex.reReviewPlan(planPath, responsePath);
-
-          // If rate-limited, wait and retry the re-review
-          if (reviewResult.verdict === "RATE_LIMITED") {
-            await this.handleCodexRateLimit(reviewResult.raw_output);
-            reviewResult = await this.codex.reReviewPlan(planPath, responsePath);
-          }
+          reviewResult = await this.retryCodexWithBackoff(
+            () => this.codex.reReviewPlan(planPath, responsePath),
+            `plan re-review round ${discussionRound}`,
+          );
         }
 
         // Persist metrics after plan review
@@ -1232,6 +1250,24 @@ export class Orchestrator {
           break;
         }
 
+        // Check if usage data is critically stale (API has been unreachable too long)
+        if (usageMonitor.getStaleDurationMs() >= USAGE_STALE_CRITICAL_MS) {
+          const staleMin = Math.round(usageMonitor.getStaleDurationMs() / 60_000);
+          const failures = usageMonitor.getConsecutiveFailures();
+          this.logger.warn(
+            `Usage data critically stale during execution (${staleMin}min, ` +
+            `${failures} failures). Winding down workers for safety.`
+          );
+          this.executionRateLimit = {
+            provider: usageMonitor.provider,
+            detail: `Usage API unreachable for ${staleMin}min (${failures} consecutive failures). Safety wind-down.`,
+            resetsAt: null,
+          };
+          await this.workers.signalWindDown("usage_limit");
+          await this.workers.waitForAllWorkers(WIND_DOWN_GRACE_PERIOD_MS);
+          break;
+        }
+
         // Check for user-requested pause signal file
         if (await this.checkPauseSignal()) {
           this.logger.warn("User-requested pause detected. Signaling workers to wind down...");
@@ -1415,37 +1451,27 @@ export class Orchestrator {
       this.lastCodeReviewRounds = 0;
       return false;
     }
-    let reviewResult = await this.codex.reviewCode(
-      state.feature,
-      planPath,
-      changedFilesPath,
-      diffPath,
+    let reviewResult = await this.retryCodexWithBackoff(
+      () => this.codex.reviewCode(state.feature, planPath, changedFilesPath, diffPath),
+      "code review",
     );
 
     let reviewRound = 0;
     const issueCounts = new Map<string, number>();
 
-    // If Codex errored, log clearly and proceed without code review
+    // If Codex errored or exhausted rate limit retries, proceed without code review
     if (reviewResult.verdict === "ERROR") {
       this.logger.error(
         `Codex code review FAILED: ${reviewResult.raw_output}. Proceeding without code review.`,
       );
-    }
-
-    // If Codex is rate-limited, wait and retry
-    if (reviewResult.verdict === "RATE_LIMITED") {
-      await this.handleCodexRateLimit(reviewResult.raw_output);
-      reviewResult = await this.codex.reviewCode(
-        state.feature,
-        planPath,
-        changedFilesPath,
-        diffPath,
-      );
+    } else if (reviewResult.verdict === "RATE_LIMITED") {
+      this.logger.error("Codex code review rate-limited after all retries. Proceeding without code review.");
     }
 
     while (
       reviewResult.verdict !== "APPROVE" &&
       reviewResult.verdict !== "ERROR" &&
+      reviewResult.verdict !== "RATE_LIMITED" &&
       reviewRound < MAX_CODE_REVIEW_ROUNDS
     ) {
       reviewRound++;
@@ -1535,13 +1561,10 @@ export class Orchestrator {
         this.lastCodeReviewRounds = reviewRound;
         return false;
       }
-      reviewResult = await this.codex.reReviewCode(responsePath, changedFilesPath);
-
-      // If rate-limited, wait and retry the re-review
-      if (reviewResult.verdict === "RATE_LIMITED") {
-        await this.handleCodexRateLimit(reviewResult.raw_output);
-        reviewResult = await this.codex.reReviewCode(responsePath, changedFilesPath);
-      }
+      reviewResult = await this.retryCodexWithBackoff(
+        () => this.codex.reReviewCode(responsePath, changedFilesPath),
+        `code re-review round ${reviewRound}`,
+      );
     }
 
     // Persist metrics after code review
@@ -1930,39 +1953,41 @@ export class Orchestrator {
   // ================================================================
 
   /**
-   * Handle a Codex review rate limit by waiting until the reported reset time
-   * and then returning so the caller can retry the review step.
+   * Retry a Codex operation with progressive backoff on rate limits.
+   *
+   * Schedule: wait 1 min → retry, wait 5 min → retry, wait 10 min → retry.
+   * If still rate-limited after all attempts, returns the RATE_LIMITED result
+   * so the caller can skip or degrade gracefully.
    */
-  private async handleCodexRateLimit(rawOutput?: string): Promise<void> {
-    await this.state.updateCodexMetrics(this.codex.getMetrics());
+  private async retryCodexWithBackoff(
+    operation: () => Promise<CodexReviewResult>,
+    label: string,
+  ): Promise<CodexReviewResult> {
+    let result = await operation();
 
-    const resetTime = this.parseCodexResetTime(rawOutput);
-    const resumeAfter = resetTime
-      ? new Date(resetTime).toISOString()
-      : new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
+    for (const waitMs of CODEX_RATE_LIMIT_BACKOFF_MS) {
+      if (result.verdict !== "RATE_LIMITED") break;
 
-    const waitMs = new Date(resumeAfter).getTime() - Date.now();
-    const waitMin = Math.max(1, Math.ceil(waitMs / 60_000));
+      await this.state.updateCodexMetrics(this.codex.getMetrics());
 
-    await this.state.setProgress(`Paused: Codex rate limited, auto-resuming in ~${waitMin}m`);
-    await logProgress(this.options.project, "paused", `Codex rate limited, auto-resuming at ${resumeAfter}`);
+      const waitMin = Math.ceil(waitMs / 60_000);
+      this.logger.warn(`${label}: Codex rate-limited. Retrying in ${waitMin} minute(s)...`);
+      await this.state.setProgress(`Paused: Codex rate limited, retrying in ${waitMin}m`);
+      await logProgress(this.options.project, "paused", `Codex rate limited (${label}), retrying in ${waitMin}m`);
+      console.log(chalk.yellow(`\n  Codex rate limit (${label}). Retrying in ${waitMin}m.\n`));
 
-    this.logger.warn(
-      `Codex rate-limited. Will auto-resume at ${resumeAfter} (~${waitMin} minutes).`,
-    );
-
-    console.log(
-      chalk.yellow(
-        `\n  Codex rate limit detected. Auto-resuming at ${resumeAfter} (~${waitMin}m).\n`,
-      ),
-    );
-
-    if (waitMs > 0) {
-      this.logger.info(`Waiting ${waitMin} minute(s) for Codex rate limit to reset...`);
-      await sleep(waitMs + 5_000);
+      await sleep(waitMs);
+      result = await operation();
     }
 
-    this.logger.info("Codex rate limit should be reset. Retrying Codex call.");
+    if (result.verdict === "RATE_LIMITED") {
+      await this.state.updateCodexMetrics(this.codex.getMetrics());
+      this.logger.error(
+        `${label}: Codex still rate-limited after ${CODEX_RATE_LIMIT_BACKOFF_MS.length} retries (1m + 5m + 10m). Giving up.`,
+      );
+    }
+
+    return result;
   }
 
   private async handleProviderRateLimit(
@@ -2010,6 +2035,9 @@ export class Orchestrator {
     await this.state.resume();
   }
 
+  // TODO(dead-code): parseCodexResetTime is no longer used after retryCodexWithBackoff
+  // replaced handleCodexRateLimit. Could be removed or re-integrated if we want
+  // to use server-reported reset times as hints for backoff intervals.
   /**
    * Parse the Codex rate limit reset time from error output.
    * Looks for "resets_at" (unix timestamp) or "resets_in_seconds" in the raw output.

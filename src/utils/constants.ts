@@ -58,6 +58,10 @@ export const MAX_TASK_RETRIES = 2; // 2 retries = 3 total attempts
 export const RETRY_FAILURE_TTL_MS = 30 * 60 * 1000; // 30 minutes - clear old failures after this (#26c)
 export const HEARTBEAT_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 export const USAGE_MONITOR_MAX_RETRIES = 3; // Retries on 429 with exponential backoff (#7)
+export const USAGE_POLL_MAX_INTERVAL_MS = 10 * 60 * 1000; // 10 min cap for adaptive backoff
+export const USAGE_POLL_BACKOFF_MULTIPLIER = 2; // Double poll interval on failure
+export const USAGE_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 min — warn about stale data
+export const USAGE_STALE_CRITICAL_MS = 15 * 60 * 1000; // 15 min — safety-pause, data too old
 
 // ============================================================
 // Event Log Configuration (V2)
@@ -117,6 +121,8 @@ export const MAX_PLAN_DISCUSSION_ROUNDS = 5;
 export const MAX_CODE_REVIEW_ROUNDS = 5;
 export const FLOW_TASK_PREFIX = "flow-";
 export const MAX_DISAGREEMENT_ROUNDS = 2; // escalate to user after this
+/** Progressive backoff schedule (in ms) for Codex rate limits: 1min, 5min, 10min, then give up. */
+export const CODEX_RATE_LIMIT_BACKOFF_MS = [1 * 60_000, 5 * 60_000, 10 * 60_000] as const;
 export const WIND_DOWN_GRACE_PERIOD_MS = 120_000; // 2 minutes for clean exit
 export const RESUME_UTILIZATION_THRESHOLD = 0.50; // resume when usage drops below this
 export const CLI_LOCK_STALE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour stale lock timeout (#10)

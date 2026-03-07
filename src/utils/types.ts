@@ -321,6 +321,12 @@ export interface ProviderUsageMonitor {
   isCritical(): boolean;
   getResetTime(): string | null;
   waitForReset(): Promise<void>;
+  /** Returns true if usage data is older than USAGE_STALE_THRESHOLD_MS. */
+  isDataStale(): boolean;
+  /** Number of consecutive poll failures (resets on success). */
+  getConsecutiveFailures(): number;
+  /** Milliseconds since the last successful poll, or 0 if never polled. */
+  getStaleDurationMs(): number;
 }
 
 export interface WorkerSharedContext {

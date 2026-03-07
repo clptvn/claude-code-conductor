@@ -102,6 +102,20 @@ export class CodexUsageMonitor implements ProviderUsageMonitor {
     return this.currentUsage.five_hour_resets_at;
   }
 
+  // Codex usage monitor reads local files, not a remote API.
+  // It is never "stale" in the way the Usage API monitor can be.
+  isDataStale(): boolean {
+    return false;
+  }
+
+  getConsecutiveFailures(): number {
+    return 0;
+  }
+
+  getStaleDurationMs(): number {
+    return 0;
+  }
+
   async waitForReset(): Promise<void> {
     const resetsAt = this.currentUsage.five_hour_resets_at;
 

@@ -10,6 +10,9 @@ import {
   USAGE_API_BETA_HEADER,
   RESUME_UTILIZATION_THRESHOLD,
   USAGE_MONITOR_MAX_RETRIES,
+  USAGE_POLL_MAX_INTERVAL_MS,
+  USAGE_POLL_BACKOFF_MULTIPLIER,
+  USAGE_STALE_THRESHOLD_MS,
 } from "../utils/constants.js";
 import type {
   ProviderUsageMonitor,
@@ -40,12 +43,15 @@ export class UsageMonitor implements ProviderUsageMonitor {
   readonly provider = "claude" as const;
   private threshold: number;
   private criticalThreshold: number;
-  private pollIntervalMs: number;
-  private intervalHandle: NodeJS.Timeout | null = null;
+  private basePollIntervalMs: number;
+  private currentPollIntervalMs: number;
+  private timeoutHandle: NodeJS.Timeout | null = null;
   private currentUsage: UsageSnapshot;
   private onWarning: (utilization: number) => void;
   private onCritical: (utilization: number, resetsAt: string) => void;
   private logger: Logger;
+  private consecutiveFailures = 0;
+  private lastSuccessfulPollTime = 0; // epoch ms, 0 = never polled successfully
 
   constructor(options: {
     threshold?: number;
@@ -57,7 +63,8 @@ export class UsageMonitor implements ProviderUsageMonitor {
   }) {
     this.threshold = options.threshold ?? DEFAULT_USAGE_THRESHOLD;
     this.criticalThreshold = options.criticalThreshold ?? DEFAULT_CRITICAL_THRESHOLD;
-    this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_USAGE_POLL_INTERVAL_MS;
+    this.basePollIntervalMs = options.pollIntervalMs ?? DEFAULT_USAGE_POLL_INTERVAL_MS;
+    this.currentPollIntervalMs = this.basePollIntervalMs;
     this.onWarning = options.onWarning;
     this.onCritical = options.onCritical;
     this.currentUsage = { ...DEFAULT_SNAPSHOT };
@@ -65,40 +72,48 @@ export class UsageMonitor implements ProviderUsageMonitor {
   }
 
   /**
-   * Start polling the usage endpoint at the configured interval.
+   * Start polling the usage endpoint with adaptive intervals.
+   * Uses self-rescheduling setTimeout instead of fixed setInterval.
+   * On poll failure: doubles the interval (up to USAGE_POLL_MAX_INTERVAL_MS).
+   * On poll success: resets the interval to the base value.
    */
   start(): void {
-    if (this.intervalHandle) {
+    if (this.timeoutHandle) {
       this.logger.warn("UsageMonitor is already running");
       return;
     }
 
-    // Log configuration at debug level to reduce verbose output (#26e)
     this.logger.debug(
-      `Starting usage monitor (poll every ${this.pollIntervalMs / 1000}s, ` +
+      `Starting usage monitor (base poll every ${this.basePollIntervalMs / 1000}s, ` +
       `warn at ${(this.threshold * 100).toFixed(0)}%, critical at ${(this.criticalThreshold * 100).toFixed(0)}%)`
     );
 
-    // Do an immediate poll, then schedule recurring
-    void this.pollAndNotify();
-
-    this.intervalHandle = setInterval(() => {
-      void this.pollAndNotify();
-    }, this.pollIntervalMs);
-
-    // Allow the process to exit even if the interval is running
-    this.intervalHandle.unref();
+    // Do an immediate poll, then schedule the next one adaptively
+    void this.pollAndNotify().then(() => this.scheduleNextPoll());
   }
 
   /**
    * Stop polling.
    */
   stop(): void {
-    if (this.intervalHandle) {
-      clearInterval(this.intervalHandle);
-      this.intervalHandle = null;
+    if (this.timeoutHandle) {
+      clearTimeout(this.timeoutHandle);
+      this.timeoutHandle = null;
       this.logger.info("Usage monitor stopped");
     }
+  }
+
+  /**
+   * Schedule the next poll using the current (possibly backed-off) interval.
+   */
+  private scheduleNextPoll(): void {
+    if (this.timeoutHandle) {
+      clearTimeout(this.timeoutHandle);
+    }
+    this.timeoutHandle = setTimeout(() => {
+      void this.pollAndNotify().then(() => this.scheduleNextPoll());
+    }, this.currentPollIntervalMs);
+    this.timeoutHandle.unref();
   }
 
   /**
@@ -178,11 +193,13 @@ export class UsageMonitor implements ProviderUsageMonitor {
    *
    * On 429 or network errors, retries with exponential backoff (1s/2s/4s).
    * Returns cached usage if all retries are exhausted.
+   * Tracks consecutive failures and adjusts the adaptive poll interval.
    */
   async poll(): Promise<UsageSnapshot> {
     const token = this.readOAuthToken();
     if (!token) {
       this.logger.warn("No OAuth token found; returning last known usage");
+      this.recordPollFailure();
       return this.getUsage();
     }
 
@@ -213,6 +230,7 @@ export class UsageMonitor implements ProviderUsageMonitor {
           this.logger.warn(
             `Usage API returned ${response.status} ${response.statusText}; returning last known usage`
           );
+          this.recordPollFailure();
           return this.getUsage();
         }
 
@@ -227,6 +245,8 @@ export class UsageMonitor implements ProviderUsageMonitor {
           seven_day_resets_at: data.seven_day.resets_at,
           last_checked: new Date().toISOString(),
         };
+
+        this.recordPollSuccess();
 
         this.logger.debug(
           `Usage: 5h=${(this.currentUsage.five_hour * 100).toFixed(1)}% ` +
@@ -249,13 +269,61 @@ export class UsageMonitor implements ProviderUsageMonitor {
       }
     }
 
-    // All retries exhausted - return cached usage
+    // All retries exhausted
+    this.recordPollFailure();
     this.logger.warn(
       `Usage API poll failed after ${USAGE_MONITOR_MAX_RETRIES} attempts` +
       (lastError ? `: ${lastError}` : "") +
-      `; returning last known usage`
+      `; returning last known usage (stale for ${Math.round(this.getStaleDurationMs() / 1000)}s, ` +
+      `${this.consecutiveFailures} consecutive failures, next poll in ${Math.round(this.currentPollIntervalMs / 1000)}s)`
     );
     return this.getUsage();
+  }
+
+  // ----------------------------------------------------------------
+  // Staleness tracking
+  // ----------------------------------------------------------------
+
+  isDataStale(): boolean {
+    if (this.lastSuccessfulPollTime === 0) return false; // never polled yet
+    return this.getStaleDurationMs() >= USAGE_STALE_THRESHOLD_MS;
+  }
+
+  getConsecutiveFailures(): number {
+    return this.consecutiveFailures;
+  }
+
+  getStaleDurationMs(): number {
+    if (this.lastSuccessfulPollTime === 0) return 0;
+    return Date.now() - this.lastSuccessfulPollTime;
+  }
+
+  private recordPollSuccess(): void {
+    if (this.consecutiveFailures > 0) {
+      this.logger.info(
+        `Usage API recovered after ${this.consecutiveFailures} consecutive failure(s). ` +
+        `Resetting poll interval to ${this.basePollIntervalMs / 1000}s.`
+      );
+    }
+    this.consecutiveFailures = 0;
+    this.lastSuccessfulPollTime = Date.now();
+    this.currentPollIntervalMs = this.basePollIntervalMs;
+  }
+
+  private recordPollFailure(): void {
+    this.consecutiveFailures++;
+    // Adaptive backoff: double interval on each failure, cap at max
+    const newInterval = Math.min(
+      this.currentPollIntervalMs * USAGE_POLL_BACKOFF_MULTIPLIER,
+      USAGE_POLL_MAX_INTERVAL_MS,
+    );
+    if (newInterval !== this.currentPollIntervalMs) {
+      this.currentPollIntervalMs = newInterval;
+      this.logger.warn(
+        `Usage API poll failed (${this.consecutiveFailures} consecutive). ` +
+        `Backing off to ${Math.round(this.currentPollIntervalMs / 1000)}s poll interval.`
+      );
+    }
   }
 
   /**

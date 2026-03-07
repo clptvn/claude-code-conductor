@@ -57,13 +57,10 @@ export async function queryWithTimeout(
     return resultText;
   })();
 
-  // TODO(timer-leak): If queryPromise rejects, this timer continues running until
-  // timeoutMs elapses. This causes a minor temporary memory leak (timer holds closure
-  // references). To fix: store timer ID and clear it when queryPromise settles.
-  // Impact: Low - timer self-clears after timeout, only an issue if many SDK queries
-  // fail in rapid succession. Not fixing now to avoid breaking changes.
+  let timerId: ReturnType<typeof setTimeout>;
+
   const timeoutPromise = new Promise<string>((resolve) => {
-    setTimeout(() => {
+    timerId = setTimeout(() => {
       timedOut = true;
       console.warn(
         `[sdk-timeout] ${label} timed out after ${Math.round(timeoutMs / 1000)}s. ` +
@@ -73,5 +70,10 @@ export async function queryWithTimeout(
     }, timeoutMs);
   });
 
-  return Promise.race([queryPromise, timeoutPromise]);
+  const result = await Promise.race([queryPromise, timeoutPromise]);
+  clearTimeout(timerId!);
+  // If timeout won the race, the queryPromise may still reject later.
+  // Attach a no-op catch to prevent unhandled promise rejection crash.
+  queryPromise.catch(() => {});
+  return result;
 }
