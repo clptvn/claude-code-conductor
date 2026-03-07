@@ -105,6 +105,8 @@ export interface Task {
   performance_requirements?: string[];
   acceptance_criteria?: string[];
   risk_level?: "low" | "medium" | "high";
+  // TODO(dead-code): review_feedback is defined but never read or written anywhere in the codebase.
+  // Consider removing in a future breaking change release.
   review_feedback?: string[];
   // V2: Worker resilience fields
   retry_count?: number; // Number of retry attempts (0 = first attempt)
@@ -128,6 +130,8 @@ export interface SessionStatus {
 
 export type SessionState = "starting" | "working" | "idle" | "pausing" | "paused" | "done" | "failed";
 
+// TODO(dead-code): ResumeInfo is defined but never used anywhere in the codebase.
+// Consider removing in a future breaking change release.
 export interface ResumeInfo {
   session_id: string;
   current_task_id: string | null;
@@ -162,6 +166,9 @@ export type MessageType =
   | "error"
   | "escalation";
 
+// TODO(dead-code): WindDownMessage is defined but never used. Code uses Message type
+// with runtime type checking (message.type === "wind_down") instead.
+// Consider removing in a future breaking change release.
 export interface WindDownMessage extends Message {
   type: "wind_down";
   metadata: {
@@ -329,6 +336,8 @@ export interface WorkerSharedContext {
  * Worker health check result.
  * Used by orchestrator to detect unhealthy workers.
  */
+// TODO(dead-code): WorkerHealthStatus is defined but never imported. ExecutionWorkerManager
+// duplicates this type inline in checkWorkerHealth() return type. Consider using this interface.
 export interface WorkerHealthStatus {
   timedOut: string[]; // Session IDs that exceeded wall-clock timeout
   stale: string[]; // Session IDs with no heartbeat (excludes timedOut)
@@ -371,6 +380,8 @@ export interface ExecutionWorkerManager {
   getRetryTracker(): TaskRetryTrackerInterface | null;
 }
 
+// TODO(dead-code): WorkerConfig is defined but never used. Worker spawning uses inline
+// options instead. Consider removing in a future breaking change release.
 export interface WorkerConfig {
   sessionId: string;
   projectDir: string;
@@ -418,6 +429,8 @@ export interface FlowSpec {
   edge_cases: string[];
 }
 
+// TODO(dead-code): ActorType is never imported, only used internally in FlowSpec and FlowFinding.
+// Consider inlining as `string` or exporting if needed by external code.
 export type ActorType = string;
 
 export interface FlowFinding {
@@ -493,6 +506,8 @@ export interface ArchitecturalDecision {
   timestamp: string;
 }
 
+// TODO(dead-code): CompletionVerification is defined but never used. Appears planned for
+// future completion verification workflow. Consider implementing or removing.
 export interface CompletionVerification {
   type_check_passed: boolean;
   tests_passed: boolean;
