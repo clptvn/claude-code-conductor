@@ -75,6 +75,8 @@ export async function extractConventions(projectDir: string): Promise<ProjectCon
   }
 
   // Spawn read-only agent to extract conventions
+  // Note: resultText initialization to "" is not needed since it's always reassigned in try block
+  // or function returns early in catch. ESLint flags this as useless assignment.
   let resultText = "";
 
   try {

@@ -474,10 +474,12 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
     };
   }
 
+  // TODO(dead-code): startTime parameter is unused. Was likely intended for timing metrics.
+  // Consider adding duration_ms to FlowTracingReport or removing parameter.
   private buildReport(
     findings: FlowFinding[],
     flowsTraced: number,
-    startTime: number,
+    _startTime: number,
   ): FlowTracingReport {
     const summary = {
       critical: findings.filter((f) => f.severity === "critical").length,

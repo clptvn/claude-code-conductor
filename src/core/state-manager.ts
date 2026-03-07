@@ -1,5 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+// TODO(dead-code): 'unlock' is imported but never used. Lock release uses the returned
+// unlock function from lock() instead. Consider removing 'unlock' from import.
 import { lock, unlock } from "proper-lockfile";
 
 import {

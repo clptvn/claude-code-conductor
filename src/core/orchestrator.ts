@@ -2355,6 +2355,8 @@ export class Orchestrator {
     const allTasks = await this.state.getAllTasks();
     let nextTaskNum = allTasks.length + 1;
 
+    // TODO(dead-code): subjectToId is declared but never read. Was likely intended for dependency resolution
+    // between flow-tracing fix tasks, but current implementation has no dependencies. Remove if unneeded.
     const subjectToId = new Map<string, string>();
 
     for (const finding of criticalAndHigh) {

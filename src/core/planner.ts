@@ -571,6 +571,10 @@ export class Planner {
   // Private: Parse task definitions from plan output
   // ----------------------------------------------------------------
 
+  // TODO(dead-code): parseTaskDefinitions and helper methods (extractJsonArray, extractJsonObject,
+  // tryParseTaskArray, validateTaskDefinition) are no longer used since the planner now writes
+  // task definitions to a dedicated JSON file (tasks-draft.json) and uses readAndValidateTasksDraft().
+  // Kept for potential fallback or backward compatibility. Consider removing in future cleanup.
   /**
    * Extract the JSON task definitions block from the plan output.
    *
