@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import chalk from "chalk";
+import { lock, unlock, check } from "proper-lockfile";
 
 import { Orchestrator } from "./core/orchestrator.js";
 import { EventLog } from "./core/event-log.js";
@@ -14,6 +15,8 @@ import {
   getOrchestratorDir,
   getTasksDir,
   getPauseSignalPath,
+  getCliLockPath,
+  CLI_LOCK_STALE_TIMEOUT_MS,
 } from "./utils/constants.js";
 
 // ============================================================
@@ -81,6 +84,140 @@ function parseWorkerRuntime(value: string): WorkerRuntime {
   );
 }
 
+// ============================================================
+// Process Lock Helpers (#10)
+// ============================================================
+
+interface LockInfo {
+  pid: number;
+  timestamp: string;
+}
+
+/**
+ * Check if a process with the given PID is still running.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    // Sending signal 0 doesn't kill the process, just checks if it exists
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Acquire a process-level lock to prevent concurrent CLI invocations.
+ * Returns a release function that must be called in a finally block.
+ *
+ * @throws Error if lock is already held by another active process
+ */
+async function acquireProcessLock(projectDir: string): Promise<() => Promise<void>> {
+  const lockPath = getCliLockPath(projectDir);
+  const lockInfoPath = lockPath + ".info";
+  const orchestratorDir = getOrchestratorDir(projectDir);
+
+  // Ensure .conductor directory exists
+  await fs.mkdir(orchestratorDir, { recursive: true, mode: 0o700 });
+
+  // Create lock file if it doesn't exist (required by proper-lockfile)
+  try {
+    await fs.access(lockPath);
+  } catch {
+    await fs.writeFile(lockPath, "", { mode: 0o600 });
+  }
+
+  // Check if lock is already held
+  const isLocked = await check(lockPath, { stale: CLI_LOCK_STALE_TIMEOUT_MS });
+
+  if (isLocked) {
+    // Check if the holding process is still alive by reading the .info file
+    try {
+      const infoContent = await fs.readFile(lockInfoPath, "utf-8");
+      const info: LockInfo = JSON.parse(infoContent);
+
+      // Check if process is dead (PID-based stale detection)
+      if (!isProcessAlive(info.pid)) {
+        console.log(chalk.yellow(`Cleaning up stale lock from dead process ${info.pid}...`));
+        // Force remove the stale lock
+        try {
+          await unlock(lockPath);
+        } catch {
+          // Lock may not be held properly, just continue
+        }
+        try {
+          await fs.unlink(lockInfoPath);
+        } catch {
+          // Info file may not exist
+        }
+        // Continue to acquire lock below
+      } else {
+        // Check if lock is older than stale timeout
+        const lockTime = new Date(info.timestamp).getTime();
+        const elapsed = Date.now() - lockTime;
+
+        if (elapsed > CLI_LOCK_STALE_TIMEOUT_MS) {
+          console.log(chalk.yellow(`Cleaning up stale lock (${Math.round(elapsed / 60000)} minutes old)...`));
+          try {
+            await unlock(lockPath);
+          } catch {
+            // Lock may not be held properly
+          }
+          try {
+            await fs.unlink(lockInfoPath);
+          } catch {
+            // Info file may not exist
+          }
+          // Continue to acquire lock below
+        } else {
+          // Lock is held by an active process
+          throw new Error(
+            `Another conductor process (PID ${info.pid}) is already running.\n` +
+            `Started at: ${info.timestamp}\n` +
+            `If this is stale, wait ${Math.round((CLI_LOCK_STALE_TIMEOUT_MS - elapsed) / 60000)} minutes or kill PID ${info.pid}.`
+          );
+        }
+      }
+    } catch (err) {
+      // If we can't read the info file but lock is held, throw generic error
+      if (err instanceof Error && err.message.includes("Another conductor")) {
+        throw err;
+      }
+      throw new Error(
+        "Another conductor process appears to be running.\n" +
+        "If this is stale, wait up to 1 hour or manually remove .conductor/conductor.lock"
+      );
+    }
+  }
+
+  // Acquire the lock
+  const release = await lock(lockPath, {
+    retries: { retries: 5, minTimeout: 100 },
+    stale: CLI_LOCK_STALE_TIMEOUT_MS
+  });
+
+  // Write lock info file with PID and timestamp
+  const lockInfo: LockInfo = {
+    pid: process.pid,
+    timestamp: new Date().toISOString(),
+  };
+  await fs.writeFile(lockInfoPath, JSON.stringify(lockInfo, null, 2), { mode: 0o600 });
+
+  // Return release function that cleans up both lock and info file
+  return async () => {
+    try {
+      await release();
+    } catch {
+      // Lock may already be released
+    }
+    try {
+      await fs.unlink(lockInfoPath);
+    } catch {
+      // Info file may already be removed
+    }
+  };
+}
+
 function printUsageSnapshot(label: string, usage: UsageSnapshot): void {
   console.log(chalk.white(`${label}:`));
   console.log(chalk.white(`      5-hour:       ${(usage.five_hour * 100).toFixed(1)}%`));
@@ -141,6 +278,16 @@ program
       forceResume: false,
     };
 
+    // Acquire process lock to prevent concurrent invocations (#10)
+    let releaseLock: (() => Promise<void>) | undefined;
+    try {
+      releaseLock = await acquireProcessLock(projectDir);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`\nCannot start conductor: ${message}\n`));
+      process.exit(1);
+    }
+
     try {
       const orchestrator = new Orchestrator(options);
       await orchestrator.run();
@@ -148,6 +295,10 @@ program
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nConductor failed: ${message}\n`));
       process.exit(1);
+    } finally {
+      if (releaseLock) {
+        await releaseLock();
+      }
     }
   });
 
@@ -456,6 +607,16 @@ program
       forceResume,
     };
 
+    // Acquire process lock to prevent concurrent invocations (#10)
+    let releaseLock: (() => Promise<void>) | undefined;
+    try {
+      releaseLock = await acquireProcessLock(projectDir);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`\nCannot resume conductor: ${message}\n`));
+      process.exit(1);
+    }
+
     try {
       const orchestrator = new Orchestrator(options);
       await orchestrator.run();
@@ -463,6 +624,10 @@ program
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nResume failed: ${message}\n`));
       process.exit(1);
+    } finally {
+      if (releaseLock) {
+        await releaseLock();
+      }
     }
   });
 
