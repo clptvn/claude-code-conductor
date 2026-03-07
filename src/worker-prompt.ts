@@ -93,7 +93,11 @@ These rules are mandatory for every task. Violations will be caught during code 
 - **Output Encoding**: All data written to HTML, SQL, or shell contexts must be escaped or parameterized. Use parameterized queries for SQL — never concatenate user input into query strings.
 - **Error Handling**: Never leak internal error details (stack traces, DB errors, internal paths) to clients. Return sanitized error messages with appropriate status codes.
 - **Secrets**: No hardcoded credentials, API keys, or tokens in source code. Use environment variables or a secrets manager. If you see existing hardcoded secrets, flag them via \`post_update\` with type "error".
-- **Dependencies**: Only import packages that already exist in package.json. Do not add new dependencies without posting an escalation message via \`post_update\` with type "escalation" explaining why the dependency is needed.`);
+- **Dependencies**: Only import packages that already exist in package.json. Do not add new dependencies without posting an escalation message via \`post_update\` with type "escalation" explaining why the dependency is needed.
+- **HTTPS/TLS**: All external API calls, webhooks, and service-to-service communication must use HTTPS. Never disable TLS certificate verification in production code.
+- **Cryptography**: Use established, well-audited cryptographic libraries (e.g., Node's crypto module, bcrypt for passwords). Never implement custom cryptographic algorithms or use deprecated/weak algorithms like MD5 or SHA1 for security purposes.
+- **CSRF Protection**: For state-changing requests from web browsers, validate CSRF tokens. Ensure anti-CSRF tokens are present in forms and verified server-side before processing.
+- **Data Classification**: Never log sensitive data (passwords, tokens, PII, financial data). If storing sensitive data, encrypt at rest using appropriate encryption standards. Mark sensitive fields clearly in type definitions.`);
 
   // ------------------------------------------------------------------
   // 3. Performance Rules (always included)
