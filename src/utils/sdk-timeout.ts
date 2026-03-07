@@ -70,10 +70,14 @@ export async function queryWithTimeout(
     }, timeoutMs);
   });
 
-  const result = await Promise.race([queryPromise, timeoutPromise]);
-  clearTimeout(timerId!);
-  // If timeout won the race, the queryPromise may still reject later.
-  // Attach a no-op catch to prevent unhandled promise rejection crash.
-  queryPromise.catch(() => {});
-  return result;
+  try {
+    const result = await Promise.race([queryPromise, timeoutPromise]);
+    return result;
+  } finally {
+    // Always clear the timer, whether the race resolved or rejected.
+    clearTimeout(timerId!);
+    // If timeout won the race, the queryPromise may still reject later.
+    // Attach a no-op catch to prevent unhandled promise rejection crash.
+    queryPromise.catch(() => {});
+  }
 }

@@ -52,6 +52,7 @@ export class UsageMonitor implements ProviderUsageMonitor {
   private logger: Logger;
   private consecutiveFailures = 0;
   private lastSuccessfulPollTime = 0; // epoch ms, 0 = never polled successfully
+  private running = false;
 
   constructor(options: {
     threshold?: number;
@@ -78,11 +79,12 @@ export class UsageMonitor implements ProviderUsageMonitor {
    * On poll success: resets the interval to the base value.
    */
   start(): void {
-    if (this.timeoutHandle) {
+    if (this.running) {
       this.logger.warn("UsageMonitor is already running");
       return;
     }
 
+    this.running = true;
     this.logger.debug(
       `Starting usage monitor (base poll every ${this.basePollIntervalMs / 1000}s, ` +
       `warn at ${(this.threshold * 100).toFixed(0)}%, critical at ${(this.criticalThreshold * 100).toFixed(0)}%)`
@@ -93,24 +95,29 @@ export class UsageMonitor implements ProviderUsageMonitor {
   }
 
   /**
-   * Stop polling.
+   * Stop polling. Guarantees no further poll callbacks will fire.
    */
   stop(): void {
+    if (!this.running) return;
+    this.running = false;
     if (this.timeoutHandle) {
       clearTimeout(this.timeoutHandle);
       this.timeoutHandle = null;
-      this.logger.info("Usage monitor stopped");
     }
+    this.logger.info("Usage monitor stopped");
   }
 
   /**
    * Schedule the next poll using the current (possibly backed-off) interval.
+   * Checks `running` flag to prevent re-arming after stop().
    */
   private scheduleNextPoll(): void {
+    if (!this.running) return;
     if (this.timeoutHandle) {
       clearTimeout(this.timeoutHandle);
     }
     this.timeoutHandle = setTimeout(() => {
+      if (!this.running) return;
       void this.pollAndNotify().then(() => this.scheduleNextPoll());
     }, this.currentPollIntervalMs);
     this.timeoutHandle.unref();

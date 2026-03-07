@@ -210,4 +210,25 @@ describe("UsageMonitor adaptive polling", () => {
 
     monitor.stop();
   });
+
+  it("stop() during in-flight poll prevents re-arming", async () => {
+    const monitor = makeMonitor({ pollIntervalMs: 1000 });
+    // First poll hangs (never resolves immediately)
+    let resolveFirst!: (v: unknown) => void;
+    fetchMock.mockReturnValueOnce(new Promise((r) => { resolveFirst = r; }));
+
+    monitor.start();
+    // stop() while first poll is still in flight
+    monitor.stop();
+
+    // Now resolve the in-flight poll
+    resolveFirst(makeApiResponse(5.0));
+    await vi.advanceTimersByTimeAsync(0);
+
+    // No further polls should fire (scheduleNextPoll checks running flag)
+    fetchMock.mockResolvedValue(makeApiResponse(5.0));
+    await vi.advanceTimersByTimeAsync(5000);
+    // Only the initial call happened; no re-arm after stop
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });
