@@ -362,6 +362,12 @@ export interface ClaimTaskInput {
 export async function handleClaimTask(
   input: ClaimTaskInput
 ): Promise<ClaimTaskResult> {
+  // Validate task_id to prevent path traversal (#28)
+  const taskIdValidation = validateFileName(input.task_id);
+  if (!taskIdValidation.valid) {
+    return { success: false, error: `Invalid task_id: ${taskIdValidation.reason}` };
+  }
+
   const dir = tasksDir();
   await ensureDir(dir);
 
@@ -453,7 +459,7 @@ export async function handleClaimTask(
     }
 
     // Read all contracts
-    let contracts: ContractSpec[] = [];
+    const contracts: ContractSpec[] = [];
     try {
       const cDir = contractsDir();
       const contractFiles = await fs.readdir(cDir);
@@ -526,6 +532,12 @@ export interface CompleteTaskResult {
 export async function handleCompleteTask(
   input: CompleteTaskInput
 ): Promise<CompleteTaskResult> {
+  // Validate task_id to prevent path traversal (#28)
+  const taskIdValidation = validateFileName(input.task_id);
+  if (!taskIdValidation.valid) {
+    return { success: false, error: `Invalid task_id: ${taskIdValidation.reason}` };
+  }
+
   // Validate input size limits (#16 - DoS prevention)
   const sizeValidation = CompleteTaskInputSchema.safeParse(input);
   if (!sizeValidation.success) {
@@ -643,6 +655,12 @@ export interface GetSessionStatusResult {
 export async function handleGetSessionStatus(
   input: GetSessionStatusInput
 ): Promise<GetSessionStatusResult> {
+  // Validate session_id to prevent path traversal (#29)
+  const sessionIdValidation = validateFileName(input.session_id);
+  if (!sessionIdValidation.valid) {
+    return { found: false };
+  }
+
   const dir = sessionsDir();
   const statusPath = path.join(dir, input.session_id, SESSION_STATUS_FILE);
 
