@@ -1,4 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 
 /**
  * Options passed to the Agent SDK `query()` call.
@@ -7,6 +8,7 @@ export interface QueryOptions {
   allowedTools: string[];
   cwd: string;
   maxTurns: number;
+  mcpServers?: Record<string, McpServerConfig>;
 }
 
 /**
@@ -17,7 +19,7 @@ export interface QueryOptions {
  * If no partial result exists, returns an empty string (callers handle empty).
  *
  * @param prompt     The prompt to send to the SDK
- * @param options    SDK query options (allowedTools, cwd, maxTurns)
+ * @param options    SDK query options (allowedTools, cwd, maxTurns, mcpServers)
  * @param timeoutMs  Maximum wall-clock time in milliseconds
  * @param label      Human-readable label for logging on timeout
  * @returns          The result text from the SDK query, or partial/empty on timeout
@@ -38,6 +40,7 @@ export async function queryWithTimeout(
         allowedTools: options.allowedTools,
         cwd: options.cwd,
         maxTurns: options.maxTurns,
+        ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
       },
     });
 

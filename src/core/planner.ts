@@ -1,11 +1,15 @@
 import fs from "node:fs/promises";
+import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { z } from "zod";
+import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 
 import type { PlannerOutput, TaskDefinition, Task, ThreatModel, TaskType } from "../utils/types.js";
-import { getPlanPath } from "../utils/constants.js";
+import { getPlanPath, getTasksDraftPath, getOrchestratorDir, PLANNER_ALLOWED_TOOLS } from "../utils/constants.js";
 import type { Logger } from "../utils/logger.js";
 import { queryWithTimeout } from "../utils/sdk-timeout.js";
+import { validateTaskArray } from "../utils/task-validator.js";
 
 // ============================================================
 // Planner
@@ -129,21 +133,32 @@ export class Planner {
     this.logger.info(`Creating implementation plan v${planVersion}...`);
 
     const planPrompt = this.buildCreatePlanPrompt(feature, qaContext);
+    const plannerMcp = this.createPlannerMcpServer();
 
-    let planOutput = await queryWithTimeout(
-      planPrompt,
-      { allowedTools: ["Read", "Glob", "Grep", "Bash"], cwd: this.projectDir, maxTurns: 80 },
-      15 * 60 * 1000, // 15 min
-      "plan-creation",
-    );
+    let planOutput: string;
+    try {
+      planOutput = await queryWithTimeout(
+        planPrompt,
+        {
+          allowedTools: PLANNER_ALLOWED_TOOLS,
+          cwd: this.projectDir,
+          maxTurns: 80,
+          mcpServers: { planner: plannerMcp },
+        },
+        15 * 60 * 1000, // 15 min
+        "plan-creation",
+      );
+    } finally {
+      await plannerMcp.instance.close().catch(() => {});
+    }
 
     this.logger.info(`Planner finished. planOutput truthy=${!!planOutput}, length=${planOutput.length}`);
     if (!planOutput) {
       throw new Error("Planner SDK session returned no output");
     }
 
-    // Parse the JSON task definitions block from the output
-    const tasks = this.parseTaskDefinitions(planOutput);
+    // Read tasks from the dedicated JSON file (authoritative source)
+    const tasks = await this.readAndValidateTasksDraft();
 
     // Write the plan markdown to disk
     const planPath = getPlanPath(this.projectDir, planVersion);
@@ -196,18 +211,31 @@ export class Planner {
       cycleFeedback,
     );
 
-    let planOutput = await queryWithTimeout(
-      replanPrompt,
-      { allowedTools: ["Read", "Glob", "Grep", "Bash"], cwd: this.projectDir, maxTurns: 80 },
-      15 * 60 * 1000, // 15 min
-      "replan",
-    );
+    const plannerMcp = this.createPlannerMcpServer();
+
+    let planOutput: string;
+    try {
+      planOutput = await queryWithTimeout(
+        replanPrompt,
+        {
+          allowedTools: PLANNER_ALLOWED_TOOLS,
+          cwd: this.projectDir,
+          maxTurns: 80,
+          mcpServers: { planner: plannerMcp },
+        },
+        15 * 60 * 1000, // 15 min
+        "replan",
+      );
+    } finally {
+      await plannerMcp.instance.close().catch(() => {});
+    }
 
     if (!planOutput) {
       throw new Error("Replanner SDK session returned no output");
     }
 
-    const tasks = this.parseTaskDefinitions(planOutput);
+    // Read tasks from the dedicated JSON file (authoritative source)
+    const tasks = await this.readAndValidateTasksDraft();
 
     const planPath = getPlanPath(this.projectDir, planVersion);
     await fs.writeFile(planPath, planOutput, "utf-8");
@@ -225,10 +253,118 @@ export class Planner {
   }
 
   // ----------------------------------------------------------------
+  // Private: MCP server + task file reading
+  // ----------------------------------------------------------------
+
+  /**
+   * Create an in-process MCP server with the validate_task_definitions tool.
+   * The planner agent can call this tool to validate its task output before the session ends.
+   */
+  private createPlannerMcpServer() {
+    const projectDir = this.projectDir;
+    const conductorDir = getOrchestratorDir(projectDir);
+
+    const validateTool = tool(
+      "validate_task_definitions",
+      "Validate task definitions JSON file. Call this after writing tasks-draft.json to check for errors. " +
+      "Returns validation results including error details if any tasks are invalid.",
+      {
+        file_path: z.string().describe(
+          "Absolute path to the tasks JSON file to validate (must be under the .conductor/ directory)",
+        ),
+      },
+      async (args: { file_path: string }) => {
+        // Constrain path to .conductor/ directory
+        const resolved = path.resolve(args.file_path);
+        const resolvedConductorDir = path.resolve(conductorDir) + path.sep;
+        if (!resolved.startsWith(resolvedConductorDir) && resolved !== path.resolve(conductorDir)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                valid: false,
+                errors: [`File path must be under ${conductorDir}`],
+              }),
+            }],
+          };
+        }
+
+        let content: string;
+        try {
+          content = await fs.readFile(resolved, "utf-8");
+        } catch (err) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                valid: false,
+                errors: [`Cannot read file: ${err instanceof Error ? err.message : String(err)}`],
+              }),
+            }],
+          };
+        }
+
+        const result = validateTaskArray(content);
+        if (result.valid) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ valid: true, task_count: result.tasks.length }),
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ valid: false, errors: result.errors }),
+          }],
+        };
+      },
+    );
+
+    return createSdkMcpServer({
+      name: "planner",
+      version: "0.1.0",
+      tools: [validateTool],
+    });
+  }
+
+  /**
+   * Read and validate the tasks-draft.json file written by the planner agent.
+   * This is the authoritative source of task definitions — no markdown fallback.
+   * Throws with diagnostics if the file is missing or invalid.
+   */
+  private async readAndValidateTasksDraft(): Promise<TaskDefinition[]> {
+    const draftPath = getTasksDraftPath(this.projectDir);
+
+    let content: string;
+    try {
+      content = await fs.readFile(draftPath, "utf-8");
+    } catch (err) {
+      throw new Error(
+        `Planner did not write tasks-draft.json. The LLM session did not follow task output instructions. ` +
+        `Expected file at: ${draftPath}. Error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const result = validateTaskArray(content);
+    if (!result.valid) {
+      throw new Error(
+        `tasks-draft.json failed validation:\n${result.errors.map((e) => `  - ${e}`).join("\n")}`,
+      );
+    }
+
+    this.logger.info(`Validated ${result.tasks.length} task(s) from ${draftPath}`);
+    return result.tasks;
+  }
+
+  // ----------------------------------------------------------------
   // Private: Prompt builders
   // ----------------------------------------------------------------
 
   private buildCreatePlanPrompt(feature: string, qaContext: string): string {
+    const tasksDraftPath = getTasksDraftPath(this.projectDir);
+
     return [
       "You are a senior software architect planning a large feature implementation.",
       "Your job is to analyze the codebase and create a detailed, actionable plan.",
@@ -270,36 +406,43 @@ export class Planner {
       "   - Attack surfaces: For each new endpoint/input/integration, what could go wrong? (Use STRIDE: Spoofing, Tampering, Repudiation, Information Disclosure, DoS, Elevation of Privilege)",
       "   - Required mitigations: For each attack surface, what specific mitigation is needed?",
       "",
-      "   Format the threat model as a JSON block tagged ```threat_model before the task definitions block.",
+      "   Format the threat model as a JSON block tagged ```threat_model in the plan markdown.",
       "",
-      "6. At the END of your plan, output a JSON block with the task definitions.",
-      "   This block MUST be fenced with triple backticks and the 'json' language tag.",
-      "   Each task object must have these fields:",
+      "6. TASK DEFINITIONS — CRITICAL STEP:",
       "",
-      "```",
-      "[",
-      "  {",
-      '    "subject": "Short title for the task",',
-      '    "description": "Detailed description including exact files, function signatures, API contracts...",',
-      '    "depends_on_subjects": ["Subject of dependency 1", "Subject of dependency 2"],',
-      '    "estimated_complexity": "small|medium|large",',
-      '    "task_type": "backend_api|frontend_ui|database|security|testing|infrastructure|general",',
-      '    "security_requirements": ["Must use auth middleware", "Must validate input with Zod schema"],',
-      '    "performance_requirements": ["Must paginate results", "Must use batch fetch"],',
-      '    "acceptance_criteria": ["Type check passes", "All new endpoints have auth", "Tests added"]',
-      "  }",
-      "]",
-      "```",
+      "   You MUST write your task definitions as a JSON array to a dedicated file.",
+      `   Use the Write tool to create: ${tasksDraftPath}`,
       "",
+      "   The file must contain a JSON array where each task object has these fields:",
+      "",
+      "   {",
+      '     "subject": "Short title for the task",',
+      '     "description": "Detailed description including exact files, function signatures, API contracts...",',
+      '     "depends_on_subjects": ["Subject of dependency 1", "Subject of dependency 2"],',
+      '     "estimated_complexity": "small|medium|large",',
+      '     "task_type": "backend_api|frontend_ui|database|security|testing|infrastructure|general",',
+      '     "security_requirements": ["Must use auth middleware", "Must validate input with Zod schema"],',
+      '     "performance_requirements": ["Must paginate results", "Must use batch fetch"],',
+      '     "acceptance_criteria": ["Type check passes", "All new endpoints have auth", "Tests added"]',
+      "   }",
+      "",
+      "   Field descriptions:",
       "   - `subject`: A concise, unique title (used to reference the task).",
       "   - `description`: Enough detail for an autonomous agent to implement it.",
       "   - `depends_on_subjects`: Array of subject strings from other tasks that must",
       "     be completed before this one can start. Use an empty array if no dependencies.",
       "   - `estimated_complexity`: 'small' (~30 min), 'medium' (~1-2 hours), 'large' (~3+ hours).",
-      "   - `task_type`: The category of work (backend_api, frontend_ui, database, security, testing, infrastructure, general).",
+      "   - `task_type`: The category of work.",
       "   - `security_requirements`: Array of specific security controls this task must implement.",
-      "   - `performance_requirements`: Array of specific performance constraints for this task.",
-      "   - `acceptance_criteria`: Array of verifiable conditions that must be true when the task is done.",
+      "   - `performance_requirements`: Array of specific performance constraints.",
+      "   - `acceptance_criteria`: Array of verifiable conditions that must be true when done.",
+      "",
+      "7. AFTER writing the tasks file, you MUST call the `mcp__planner__validate_task_definitions` tool",
+      `   with the file path: ${tasksDraftPath}`,
+      "   This tool validates that all tasks are well-formed, have no duplicate subjects,",
+      "   no dangling dependency references, and no dependency cycles.",
+      "   If validation fails, fix the errors and re-write the file, then validate again.",
+      "   Do NOT finish until validation passes.",
       "",
       "CRITICAL SECURITY RULE: When a task introduces a new attack surface (endpoint, file upload,",
       "webhook, user input field, external integration), you MUST include security_requirements",
@@ -314,13 +457,9 @@ export class Planner {
       "ANCHOR TASKS: Mark tasks that have no dependencies and are depended upon by 2+ other tasks.",
       "These 'anchor tasks' will be executed first to establish shared foundations (types, schemas, utilities).",
       "",
-      "Make sure the JSON block is valid JSON and appears at the very end of your output.",
-      "",
-      "CRITICAL: You MUST include the JSON task definitions block at the end of your output.",
-      "Without this JSON block, the orchestrator cannot create tasks and the entire plan will be",
-      "rejected. The JSON block is the most important part of your output.",
-      "If you are running low on turns, prioritize outputting the JSON task definitions over",
-      "further exploration. The plan markdown + JSON block is what matters.",
+      `CRITICAL: You MUST write the task definitions JSON file to ${tasksDraftPath} and validate it.`,
+      "Without this file, the orchestrator cannot create tasks and the entire plan will be rejected.",
+      "If you are running low on turns, prioritize writing the tasks file over further exploration.",
     ].join("\n");
   }
 
@@ -332,6 +471,8 @@ export class Planner {
     codexFeedback: string | null,
     cycleFeedback?: string,
   ): string {
+    const tasksDraftPath = getTasksDraftPath(this.projectDir);
+
     const completedSummary =
       completedTasks.length > 0
         ? completedTasks
@@ -408,26 +549,20 @@ export class Planner {
       "5. If previous cycle findings are provided (from flow-tracing or code review),",
       "   create specific fix tasks for each unresolved issue.",
       "",
-      "6. Create an updated Markdown plan and a JSON task block at the end,",
-      "   following the same format as the original plan:",
+      "6. Create an updated Markdown plan describing the remaining work.",
       "",
-      "```",
-      "[",
-      "  {",
-      '    "subject": "Short title for the task",',
-      '    "description": "Detailed description including exact files, function signatures, API contracts...",',
-      '    "depends_on_subjects": ["Subject of dependency 1"],',
-      '    "estimated_complexity": "small|medium|large",',
-      '    "task_type": "backend_api|frontend_ui|database|security|testing|infrastructure|general",',
-      '    "security_requirements": ["Must use auth middleware", "Must validate input with Zod schema"],',
-      '    "performance_requirements": ["Must paginate results", "Must use batch fetch"],',
-      '    "acceptance_criteria": ["Type check passes", "All new endpoints have auth", "Tests added"]',
-      "  }",
-      "]",
-      "```",
+      "7. TASK DEFINITIONS — CRITICAL STEP:",
       "",
-      "Only include tasks that still need to be done. Do not include",
-      "tasks that were already completed successfully.",
+      `   Use the Write tool to write your task definitions as a JSON array to: ${tasksDraftPath}`,
+      "",
+      "   Each task object must have: subject, description, depends_on_subjects,",
+      "   estimated_complexity, task_type, security_requirements, performance_requirements,",
+      "   acceptance_criteria. Only include tasks that still need to be done.",
+      "",
+      "8. AFTER writing the tasks file, call `mcp__planner__validate_task_definitions`",
+      `   with file path: ${tasksDraftPath}`,
+      "   If validation fails, fix the errors and re-write, then validate again.",
+      "   Do NOT finish until validation passes.",
     ].join("\n");
   }
 
@@ -478,6 +613,34 @@ export class Planner {
             bestTasks = tasks;
           }
         }
+      }
+    }
+
+    // Strategy 3: Extract individual JSON objects that look like task definitions
+    // This handles cases where the JSON array wrapper is missing or malformed
+    if (bestTasks.length === 0) {
+      this.logger.warn("Strategies 1-2 failed. Trying to extract individual task objects...");
+      const individualTasks: TaskDefinition[] = [];
+      // Match standalone JSON objects that contain "subject" and "description" keys
+      const objectRegex = /\{\s*"subject"\s*:/g;
+      let objMatch: RegExpExecArray | null;
+      while ((objMatch = objectRegex.exec(planOutput)) !== null) {
+        const jsonText = this.extractJsonObject(planOutput, objMatch.index);
+        if (jsonText) {
+          try {
+            const parsed = JSON.parse(jsonText) as unknown;
+            const validated = this.validateTaskDefinition(parsed);
+            if (validated) {
+              individualTasks.push(validated);
+            }
+          } catch {
+            // skip malformed individual objects
+          }
+        }
+      }
+      if (individualTasks.length > 0) {
+        this.logger.info(`Strategy 3 recovered ${individualTasks.length} task(s) from individual objects`);
+        bestTasks = individualTasks;
       }
     }
 
@@ -534,6 +697,49 @@ export class Planner {
     }
 
     return null; // unmatched brackets
+  }
+
+  /**
+   * Extract a JSON object from text starting at startIdx using bracket matching.
+   */
+  private extractJsonObject(text: string, startIdx: number): string | null {
+    if (startIdx >= text.length || text[startIdx] !== "{") return null;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let j = startIdx; j < text.length; j++) {
+      const ch = text[j];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+
+      if (inString) continue;
+
+      if (ch === "{") {
+        depth++;
+      } else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          return text.substring(startIdx, j + 1);
+        }
+      }
+    }
+
+    return null;
   }
 
   /**

@@ -27,6 +27,7 @@ export const RESULT_FILE = "result.json";
 export const ESCALATION_FILE = "escalation.json";
 export const PAUSE_SIGNAL_FILE = "pause.signal";
 export const CLI_LOCK_FILE = "conductor.lock"; // Process lock file (#10)
+export const TASKS_DRAFT_FILE = "tasks-draft.json"; // Planner writes task definitions here (#4)
 
 // ============================================================
 // Default Configuration
@@ -160,6 +161,23 @@ export const WORKER_ALLOWED_TOOLS = [
 // Flow-Tracing Worker Configuration (read-only)
 // ============================================================
 
+// ============================================================
+// Planner Configuration
+// ============================================================
+
+export const PLANNER_ALLOWED_TOOLS = [
+  "Read",
+  "Glob",
+  "Grep",
+  "Bash",
+  "Write", // for writing tasks-draft.json
+  "mcp__planner__validate_task_definitions",
+];
+
+// ============================================================
+// Flow-Tracing Worker Configuration (read-only)
+// ============================================================
+
 export const FLOW_TRACING_READ_ONLY_TOOLS = [
   "Read",
   "Bash",
@@ -270,6 +288,10 @@ export function getProgressLogPath(projectDir: string): string {
 
 export function getCliLockPath(projectDir: string): string {
   return path.join(projectDir, ORCHESTRATOR_DIR, CLI_LOCK_FILE);
+}
+
+export function getTasksDraftPath(projectDir: string): string {
+  return path.join(projectDir, ORCHESTRATOR_DIR, TASKS_DRAFT_FILE);
 }
 
 // ============================================================

@@ -43,6 +43,7 @@ import {
   WIND_DOWN_GRACE_PERIOD_MS,
   DEFAULT_WORKER_TIMEOUT_MS,
   GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+  getTasksDraftPath,
 } from "../utils/constants.js";
 
 import { Logger } from "../utils/logger.js";
@@ -282,6 +283,14 @@ export class Orchestrator {
           phaseDurations.planning_ms = 0; // Set to 0 when skipped (#26h)
           this.logger.info("Skipping planning phase (resuming with existing tasks).");
         } else {
+          // Delete stale tasks-draft.json before planning (#4)
+          // The orchestrator is the sole owner of this file's lifecycle.
+          try {
+            await fs.unlink(getTasksDraftPath(this.options.project));
+          } catch {
+            // File doesn't exist — that's fine
+          }
+
           const planStart = Date.now();
           planVersion = await this.plan(planVersion, cycleNum > 1);
           phaseDurations.planning_ms = Date.now() - planStart;

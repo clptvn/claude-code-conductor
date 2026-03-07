@@ -36,16 +36,22 @@ Ask in rounds of 3-4 questions until all areas are covered. After each round, re
 
 ### Step 3: Confirm configuration
 
-Use the AskUserQuestion tool to confirm configuration. Ask a single question with multiSelect enabled:
+Use the AskUserQuestion tool to confirm configuration. Use a **two-step flow**:
 
-Question: "Want to change any defaults? Select any to override." with options:
-- **Concurrency** (default: 2 parallel workers)
-- **Worker runtime** (default: Claude workers; switch to Codex CLI workers)
-- **Max cycles** (default: 5 cycles before escalating)
-- **Skip Codex** (default: No -- Codex reviews plans and code each cycle)
-- **Dry run** (default: No -- set to yes to only generate the plan)
+**First**, ask a single question:
+- "Do you want to use all default conductor settings, or customize?"
+- Options: "Use all defaults" (description: "2 workers, Claude runtime, 5 max cycles, Codex reviews on") and "Customize" (description: "I want to change one or more settings")
 
-If the user selects any, ask follow-up questions for the specific values. If the user selects nothing / "Other" with no text, use all defaults.
+**If the user selects "Use all defaults"**, proceed with defaults. Do not ask further config questions.
+
+**If the user selects "Customize"**, ask a follow-up multiSelect question:
+- "Which settings do you want to change?" with options:
+  - **Concurrency** (default: 2 parallel workers)
+  - **Worker runtime** (default: Claude workers; switch to Codex CLI workers)
+  - **Max cycles** (default: 5 cycles before escalating)
+  - **Skip Codex** (default: No -- Codex reviews plans and code each cycle)
+  - **Dry run** (default: No -- set to yes to only generate the plan without executing)
+- Then ask specific follow-up questions for each selected setting.
 
 ## Phase 2: Write Context File & Launch
 
