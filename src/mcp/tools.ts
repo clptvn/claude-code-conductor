@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { lock, unlock } from "proper-lockfile";
+import { lock } from "proper-lockfile";
+import { z } from "zod";
 import type {
   Message,
   MessageType,
@@ -21,8 +22,55 @@ import {
   CONTRACTS_DIR,
   DECISIONS_FILE,
 } from "../utils/constants.js";
+import { rankClaimableTasks, type RankedTask } from "../core/task-scheduler.js";
+import { validateFileName, validateFileNames } from "../utils/validation.js";
 
 const execFileAsync = promisify(execFile);
+
+// ============================================================
+// Input Size Limits (#16 - DoS prevention)
+// ============================================================
+
+const MAX_RESULT_SUMMARY_LENGTH = 10_000; // 10K chars
+const MAX_CONTRACT_SPEC_LENGTH = 50_000;  // 50K chars
+const MAX_DECISION_LENGTH = 10_000;       // 10K chars
+const MAX_MESSAGE_CONTENT_LENGTH = 10_000; // 10K chars
+
+// Zod schemas for input validation
+const CompleteTaskInputSchema = z.object({
+  task_id: z.string(),
+  result_summary: z.string().max(MAX_RESULT_SUMMARY_LENGTH, {
+    message: `result_summary exceeds maximum length of ${MAX_RESULT_SUMMARY_LENGTH} characters`,
+  }),
+  files_changed: z.array(z.string()).optional(),
+});
+
+const RegisterContractInputSchema = z.object({
+  contract_id: z.string(),
+  contract_type: z.enum(["api_endpoint", "type_definition", "event_schema", "database_schema"]),
+  spec: z.string().max(MAX_CONTRACT_SPEC_LENGTH, {
+    message: `spec exceeds maximum length of ${MAX_CONTRACT_SPEC_LENGTH} characters`,
+  }),
+});
+
+const RecordDecisionInputSchema = z.object({
+  category: z.string(),
+  decision: z.string().max(MAX_DECISION_LENGTH, {
+    message: `decision exceeds maximum length of ${MAX_DECISION_LENGTH} characters`,
+  }),
+  rationale: z.string().max(MAX_DECISION_LENGTH, {
+    message: `rationale exceeds maximum length of ${MAX_DECISION_LENGTH} characters`,
+  }),
+  task_id: z.string().optional(),
+});
+
+const PostUpdateInputSchema = z.object({
+  type: z.string(),
+  content: z.string().max(MAX_MESSAGE_CONTENT_LENGTH, {
+    message: `content exceeds maximum length of ${MAX_MESSAGE_CONTENT_LENGTH} characters`,
+  }),
+  to: z.string().optional(),
+});
 
 // ============================================================
 // Environment helpers
@@ -78,7 +126,7 @@ function getProjectDir(): string {
  * Ensure a directory exists, creating it and parents if necessary.
  */
 async function ensureDir(dir: string): Promise<void> {
-  await fs.mkdir(dir, { recursive: true });
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
 }
 
 /**
@@ -187,7 +235,13 @@ export interface PostUpdateInput {
 
 export async function handlePostUpdate(
   input: PostUpdateInput
-): Promise<Message> {
+): Promise<Message | { error: string }> {
+  // Validate input size limits (#16 - DoS prevention)
+  const sizeValidation = PostUpdateInputSchema.safeParse(input);
+  if (!sizeValidation.success) {
+    return { error: sizeValidation.error.errors.map(e => e.message).join("; ") };
+  }
+
   const dir = messagesDir();
   await ensureDir(dir);
 
@@ -205,7 +259,31 @@ export async function handlePostUpdate(
   }
 
   const filePath = path.join(dir, `${sessionId}.jsonl`);
-  await fs.appendFile(filePath, JSON.stringify(message) + "\n", "utf-8");
+
+  // Ensure file exists before locking (proper-lockfile requirement)
+  try {
+    await fs.access(filePath);
+  } catch {
+    await fs.writeFile(filePath, "", { encoding: "utf-8", mode: 0o600 });
+  }
+
+  // Lock file to prevent interleaved writes from concurrent workers (#17)
+  let release: (() => Promise<void>) | undefined;
+  try {
+    release = await lock(filePath, {
+      retries: { retries: 5, minTimeout: 100 },
+      stale: 5000,
+    });
+    await fs.appendFile(filePath, JSON.stringify(message) + "\n", { encoding: "utf-8", mode: 0o600 });
+  } finally {
+    if (release) {
+      try {
+        await release();
+      } catch {
+        // Lock may already be released
+      }
+    }
+  }
 
   return message;
 }
@@ -216,9 +294,21 @@ export async function handlePostUpdate(
 
 export interface GetTasksInput {
   status_filter?: TaskStatus;
+  ranked?: boolean; // V2: Return tasks sorted by priority
 }
 
-export async function handleGetTasks(input: GetTasksInput): Promise<Task[]> {
+/**
+ * Get tasks from the task board.
+ *
+ * If ranked=true, returns only claimable tasks (pending with all dependencies
+ * completed), sorted by priority score (highest first). The returned tasks
+ * include priority_score and critical_path_depth fields.
+ *
+ * If ranked=false or omitted, returns all tasks sorted by ID.
+ */
+export async function handleGetTasks(
+  input: GetTasksInput,
+): Promise<Task[] | RankedTask[]> {
   const dir = tasksDir();
   await ensureDir(dir);
 
@@ -236,13 +326,26 @@ export async function handleGetTasks(input: GetTasksInput): Promise<Task[]> {
     const filePath = path.join(dir, file);
     const task = await readJsonFile<Task>(filePath);
     if (task) {
-      if (!input.status_filter || task.status === input.status_filter) {
+      // When ranked=true, we need all tasks for dependency computation
+      // so we skip status_filter here and filter after ranking
+      if (!input.ranked) {
+        if (!input.status_filter || task.status === input.status_filter) {
+          tasks.push(task);
+        }
+      } else {
         tasks.push(task);
       }
     }
   }
 
-  // Sort by id
+  // V2: If ranked=true, return prioritized claimable tasks
+  if (input.ranked) {
+    // rankClaimableTasks filters to pending tasks with completed deps
+    // and returns them sorted by priority score descending
+    return rankClaimableTasks(tasks);
+  }
+
+  // Default: sort by id
   tasks.sort((a, b) => a.id.localeCompare(b.id));
 
   return tasks;
@@ -273,14 +376,16 @@ export async function handleClaimTask(
 
   let release: (() => Promise<void>) | undefined;
   try {
-    release = await lock(taskPath, { retries: { retries: 3, minTimeout: 100 } });
+    release = await lock(taskPath, { retries: { retries: 5, minTimeout: 100 } });
 
+    // Double-check pattern: Re-read task after acquiring lock to prevent TOCTOU race (#5)
+    // Another worker may have claimed or modified the task between our access check and lock acquisition
     const task = await readJsonFile<Task>(taskPath);
     if (!task) {
       return { success: false, error: `Task not found: ${input.task_id}` };
     }
 
-    // Verify task is pending
+    // Verify task is still pending after lock acquisition (double-check)
     if (task.status !== "pending") {
       return {
         success: false,
@@ -308,7 +413,7 @@ export async function handleClaimTask(
     task.owner = sessionId;
     task.started_at = new Date().toISOString();
 
-    await fs.writeFile(taskPath, JSON.stringify(task, null, 2), "utf-8");
+    await fs.writeFile(taskPath, JSON.stringify(task, null, 2), { encoding: "utf-8", mode: 0o600 });
 
     // Gather dependency context
     const dependency_context: { task_id: string; result_summary: string | null; files_changed: string[] }[] = [];
@@ -421,6 +526,27 @@ export interface CompleteTaskResult {
 export async function handleCompleteTask(
   input: CompleteTaskInput
 ): Promise<CompleteTaskResult> {
+  // Validate input size limits (#16 - DoS prevention)
+  const sizeValidation = CompleteTaskInputSchema.safeParse(input);
+  if (!sizeValidation.success) {
+    return {
+      success: false,
+      error: sizeValidation.error.errors.map(e => e.message).join("; "),
+    };
+  }
+
+  // Validate files_changed entries to prevent path traversal (#14)
+  if (input.files_changed && input.files_changed.length > 0) {
+    const failures = validateFileNames(input.files_changed);
+    if (failures.length > 0) {
+      const failureDetails = failures.map(f => `  - "${f.filename}": ${f.reason}`).join("\n");
+      return {
+        success: false,
+        error: `Invalid files_changed entries:\n${failureDetails}`,
+      };
+    }
+  }
+
   const dir = tasksDir();
   await ensureDir(dir);
 
@@ -459,7 +585,7 @@ export async function handleCompleteTask(
       task.files_changed = input.files_changed;
     }
 
-    await fs.writeFile(taskPath, JSON.stringify(task, null, 2), "utf-8");
+    await fs.writeFile(taskPath, JSON.stringify(task, null, 2), { encoding: "utf-8", mode: 0o600 });
 
     // Post a task_completed message to the orchestrator message log
     const msgDir = messagesDir();
@@ -482,7 +608,7 @@ export async function handleCompleteTask(
     await fs.appendFile(
       msgPath,
       JSON.stringify(completionMessage) + "\n",
-      "utf-8"
+      { encoding: "utf-8", mode: 0o600 }
     );
 
     return { success: true, task };
@@ -540,7 +666,19 @@ export interface RegisterContractInput {
 
 export async function handleRegisterContract(
   input: RegisterContractInput
-): Promise<ContractSpec> {
+): Promise<ContractSpec | { error: string }> {
+  // Validate input size limits (#16 - DoS prevention)
+  const sizeValidation = RegisterContractInputSchema.safeParse(input);
+  if (!sizeValidation.success) {
+    return { error: sizeValidation.error.errors.map(e => e.message).join("; ") };
+  }
+
+  // Validate contract_id to prevent path traversal (#14)
+  const validation = validateFileName(input.contract_id);
+  if (!validation.valid) {
+    return { error: `Invalid contract_id: ${validation.reason}` };
+  }
+
   const dir = contractsDir();
   await ensureDir(dir);
 
@@ -555,7 +693,7 @@ export async function handleRegisterContract(
   };
 
   const filePath = path.join(dir, `${input.contract_id}.json`);
-  await fs.writeFile(filePath, JSON.stringify(contract, null, 2), "utf-8");
+  await fs.writeFile(filePath, JSON.stringify(contract, null, 2), { encoding: "utf-8", mode: 0o600 });
 
   return contract;
 }
@@ -617,7 +755,13 @@ export interface RecordDecisionInput {
 
 export async function handleRecordDecision(
   input: RecordDecisionInput
-): Promise<ArchitecturalDecision> {
+): Promise<ArchitecturalDecision | { error: string }> {
+  // Validate input size limits (#16 - DoS prevention)
+  const sizeValidation = RecordDecisionInputSchema.safeParse(input);
+  if (!sizeValidation.success) {
+    return { error: sizeValidation.error.errors.map(e => e.message).join("; ") };
+  }
+
   const filePath = decisionsPath();
   await ensureDir(path.dirname(filePath));
 
@@ -635,7 +779,30 @@ export async function handleRecordDecision(
     timestamp: new Date().toISOString(),
   };
 
-  await fs.appendFile(filePath, JSON.stringify(record) + "\n", "utf-8");
+  // Ensure file exists before locking (proper-lockfile requirement)
+  try {
+    await fs.access(filePath);
+  } catch {
+    await fs.writeFile(filePath, "", { encoding: "utf-8", mode: 0o600 });
+  }
+
+  // Lock file to prevent interleaved writes from concurrent workers (#17)
+  let release: (() => Promise<void>) | undefined;
+  try {
+    release = await lock(filePath, {
+      retries: { retries: 5, minTimeout: 100 },
+      stale: 5000,
+    });
+    await fs.appendFile(filePath, JSON.stringify(record) + "\n", { encoding: "utf-8", mode: 0o600 });
+  } finally {
+    if (release) {
+      try {
+        await release();
+      } catch {
+        // Lock may already be released
+      }
+    }
+  }
 
   return record;
 }

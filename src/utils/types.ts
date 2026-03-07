@@ -40,6 +40,16 @@ export type OrchestratorStatus =
   | "failed"
   | "escalated";
 
+export interface PhaseDurations {
+  planning_ms?: number;
+  conventions_ms?: number;
+  codex_plan_review_ms?: number;
+  execution_ms?: number;
+  code_review_ms?: number;
+  flow_tracing_ms?: number;
+  checkpoint_ms?: number;
+}
+
 export interface CycleRecord {
   cycle: number;
   plan_version: number;
@@ -53,6 +63,16 @@ export interface CycleRecord {
   started_at: string;
   completed_at: string;
   flow_tracing?: FlowTracingSummary;
+  phase_durations?: PhaseDurations;
+  blast_radius?: BlastRadius;
+}
+
+export interface BlastRadius {
+  files_changed: number;
+  lines_added: number;
+  lines_removed: number;
+  critical_files_touched: string[];
+  warnings: string[];
 }
 
 export interface FlowTracingSummary {
@@ -86,6 +106,9 @@ export interface Task {
   acceptance_criteria?: string[];
   risk_level?: "low" | "medium" | "high";
   review_feedback?: string[];
+  // V2: Worker resilience fields
+  retry_count?: number; // Number of retry attempts (0 = first attempt)
+  last_error?: string; // Error message from previous attempt (sanitized)
 }
 
 export type TaskStatus = "pending" | "in_progress" | "completed" | "failed";
@@ -299,6 +322,28 @@ export interface WorkerSharedContext {
   projectRules?: string;
   featureDescription?: string;
   threatModelSummary?: string;
+  projectGuidance?: string; // V2: Auto-detected project guidance
+}
+
+/**
+ * Worker health check result.
+ * Used by orchestrator to detect unhealthy workers.
+ */
+export interface WorkerHealthStatus {
+  timedOut: string[]; // Session IDs that exceeded wall-clock timeout
+  stale: string[]; // Session IDs with no heartbeat (excludes timedOut)
+}
+
+/**
+ * Retry tracker interface for task failure tracking.
+ * Defined here as a minimal interface to avoid circular imports.
+ */
+export interface TaskRetryTrackerInterface {
+  recordFailure(taskId: string, error: string): void;
+  shouldRetry(taskId: string): boolean;
+  getRetryContext(taskId: string): string | null;
+  getRetryCount(taskId: string): number;
+  getLastError(taskId: string): string | null;
 }
 
 export interface ExecutionWorkerManager {
@@ -311,6 +356,19 @@ export interface ExecutionWorkerManager {
   waitForAllWorkers(timeoutMs: number): Promise<void>;
   killAllWorkers(): Promise<void>;
   getWorkerEvents(): OrchestratorEvent[];
+
+  // V2: Worker resilience methods
+  /**
+   * Check health of all active workers.
+   * Returns lists of timed-out and stale workers.
+   */
+  checkWorkerHealth(): WorkerHealthStatus;
+
+  /**
+   * Get the task retry tracker for recording failures.
+   * Returns null if retry tracking is not supported.
+   */
+  getRetryTracker(): TaskRetryTrackerInterface | null;
 }
 
 export interface WorkerConfig {
@@ -500,3 +558,37 @@ export interface KnownIssue {
   addressed: boolean;
   assigned_to_task?: string;
 }
+
+// ============================================================
+// Project Auto-Detection Types (V2)
+// ============================================================
+
+export interface ProjectProfile {
+  detected_at: string;
+  languages: ("typescript" | "javascript" | "python")[];
+  frameworks: string[]; // e.g., 'nextjs', 'express', 'fastapi'
+  test_runners: string[]; // e.g., 'vitest', 'jest', 'pytest'
+  linters: string[]; // e.g., 'eslint', 'prettier', 'ruff'
+  ci_systems: string[]; // e.g., 'github-actions', 'gitlab-ci'
+  package_managers: string[]; // e.g., 'npm', 'yarn', 'pip'
+}
+
+// ============================================================
+// Structured Event Log Types (V2)
+// ============================================================
+
+export type StructuredEvent =
+  | { type: "phase_start"; phase: string; timestamp: string }
+  | { type: "phase_end"; phase: string; timestamp: string; duration_ms: number }
+  | { type: "worker_spawn"; session_id: string; timestamp: string }
+  | { type: "worker_complete"; session_id: string; timestamp: string; tasks_completed: number }
+  | { type: "worker_fail"; session_id: string; timestamp: string; error: string }
+  | { type: "worker_timeout"; session_id: string; timestamp: string; duration_ms: number }
+  | { type: "task_claimed"; task_id: string; session_id: string; timestamp: string }
+  | { type: "task_completed"; task_id: string; session_id: string; timestamp: string }
+  | { type: "task_failed"; task_id: string; session_id: string; timestamp: string; error: string }
+  | { type: "task_retried"; task_id: string; retry_count: number; timestamp: string }
+  | { type: "review_verdict"; verdict: string; timestamp: string }
+  | { type: "usage_warning"; utilization: number; timestamp: string }
+  | { type: "scheduling_decision"; task_id: string; score: number; timestamp: string }
+  | { type: "project_detection"; profile: ProjectProfile; timestamp: string };

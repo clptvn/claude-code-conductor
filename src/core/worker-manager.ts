@@ -11,6 +11,11 @@ import type {
   WorkerSharedContext,
 } from "../utils/types.js";
 import {
+  TaskRetryTracker,
+  WorkerTimeoutTracker,
+  HeartbeatTracker,
+} from "./worker-resilience.js";
+import {
   WORKER_ALLOWED_TOOLS,
   DEFAULT_WORKER_MAX_TURNS,
   MESSAGES_DIR,
@@ -51,12 +56,22 @@ export class WorkerManager implements ExecutionWorkerManager {
 
   private workerContext: WorkerSharedContext = {};
 
+  // V2: Resilience trackers
+  private timeoutTracker: WorkerTimeoutTracker;
+  private heartbeatTracker: HeartbeatTracker;
+  private retryTracker: TaskRetryTracker;
+
   constructor(
     private projectDir: string,
     private orchestratorDir: string,
     private mcpServerPath: string,
     private logger: Logger,
-  ) {}
+  ) {
+    // Initialize resilience trackers
+    this.timeoutTracker = new WorkerTimeoutTracker();
+    this.heartbeatTracker = new HeartbeatTracker();
+    this.retryTracker = new TaskRetryTracker();
+  }
 
   // ----------------------------------------------------------------
   // Public API
@@ -116,6 +131,10 @@ export class WorkerManager implements ExecutionWorkerManager {
       rateLimitReported: false,
     };
 
+    // V2: Start resilience tracking
+    this.timeoutTracker.startTracking(sessionId);
+    this.heartbeatTracker.recordHeartbeat(sessionId); // Initial heartbeat
+
     // Launch the worker as a background async task
     handle.promise = this.runWorker(sessionId, handle);
 
@@ -168,6 +187,10 @@ export class WorkerManager implements ExecutionWorkerManager {
       startedAt: new Date().toISOString(),
       rateLimitReported: false,
     };
+
+    // V2: Start resilience tracking for sentinel
+    this.timeoutTracker.startTracking(sentinelId);
+    this.heartbeatTracker.recordHeartbeat(sentinelId);
 
     // Launch with read-only tools and sentinel prompt
     handle.promise = this.runSentinelWorker(sentinelId, handle, sentinelPrompt);
@@ -309,6 +332,38 @@ export class WorkerManager implements ExecutionWorkerManager {
     return events;
   }
 
+  /**
+   * V2: Check the health of all active workers.
+   *
+   * Returns lists of workers that have timed out (exceeded wall-clock timeout)
+   * and workers that are stale (no heartbeat activity).
+   *
+   * Performance: O(n) where n = active workers.
+   */
+  checkWorkerHealth(): {
+    timedOut: string[];
+    stale: string[];
+  } {
+    const timedOut = this.timeoutTracker
+      .getTimedOutWorkers()
+      .filter((id) => this.activeWorkers.has(id));
+
+    const stale = this.heartbeatTracker
+      .getStaleWorkers()
+      .filter((id) => this.activeWorkers.has(id) && !timedOut.includes(id));
+
+    return { timedOut, stale };
+  }
+
+  /**
+   * V2: Get the retry tracker for task failure handling.
+   *
+   * The orchestrator uses this to record failures and check retry eligibility.
+   */
+  getRetryTracker(): TaskRetryTracker {
+    return this.retryTracker;
+  }
+
   // ----------------------------------------------------------------
   // Private: Worker execution
   // ----------------------------------------------------------------
@@ -346,7 +401,23 @@ export class WorkerManager implements ExecutionWorkerManager {
       });
 
       for await (const event of asyncIterable) {
-        this.processWorkerEvent(sessionId, handle, event);
+        try {
+          this.processWorkerEvent(sessionId, handle, event);
+        } catch (err) {
+          // Log error and record failure event, but continue processing
+          // to avoid dropping subsequent events from the SDK stream
+          const errorMessage =
+            err instanceof Error ? err.message : String(err);
+          this.logger.error(
+            `Worker ${sessionId} event processing error: ${errorMessage}`
+          );
+          this.recordEvent(handle, {
+            type: "session_failed",
+            sessionId,
+            error: `Event processing error: ${errorMessage}`,
+          });
+          // Continue processing other events - don't break the loop
+        }
       }
 
       // Worker completed normally
@@ -371,6 +442,10 @@ export class WorkerManager implements ExecutionWorkerManager {
 
       await this.updateSessionStatus(sessionId, "failed", errorMessage);
     } finally {
+      // V2: Clean up resilience trackers
+      this.timeoutTracker.stopTracking(sessionId);
+      this.heartbeatTracker.cleanup(sessionId);
+
       // Remove from active workers once done
       this.activeWorkers.delete(sessionId);
     }
@@ -412,7 +487,23 @@ export class WorkerManager implements ExecutionWorkerManager {
       });
 
       for await (const event of asyncIterable) {
-        this.processWorkerEvent(sessionId, handle, event);
+        try {
+          this.processWorkerEvent(sessionId, handle, event);
+        } catch (err) {
+          // Log error and record failure event, but continue processing
+          // to avoid dropping subsequent events from the SDK stream
+          const errorMessage =
+            err instanceof Error ? err.message : String(err);
+          this.logger.error(
+            `Sentinel ${sessionId} event processing error: ${errorMessage}`
+          );
+          this.recordEvent(handle, {
+            type: "session_failed",
+            sessionId,
+            error: `Event processing error: ${errorMessage}`,
+          });
+          // Continue processing other events - don't break the loop
+        }
       }
 
       // Sentinel completed normally
@@ -437,6 +528,10 @@ export class WorkerManager implements ExecutionWorkerManager {
 
       await this.updateSessionStatus(sessionId, "failed", errorMessage);
     } finally {
+      // V2: Clean up resilience trackers
+      this.timeoutTracker.stopTracking(sessionId);
+      this.heartbeatTracker.cleanup(sessionId);
+
       this.activeWorkers.delete(sessionId);
     }
   }
@@ -454,6 +549,12 @@ export class WorkerManager implements ExecutionWorkerManager {
     // The SDK emits events with a `type` field. We capture the ones
     // that are relevant for orchestrator monitoring.
     const eventType = event.type as string | undefined;
+
+    // V2: Record heartbeat on all non-error events to prevent false stale detection
+    // (previously only recorded on tool_use/result, causing false positives)
+    if (eventType !== "error") {
+      this.heartbeatTracker.recordHeartbeat(sessionId);
+    }
 
     if (eventType === "result") {
       const resultText = coerceLogText(event.result);

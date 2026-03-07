@@ -16,6 +16,7 @@ import {
   FLOW_TRACING_READ_ONLY_TOOLS,
   FLOW_TRACING_WORKER_MAX_TURNS,
   MAX_FLOW_TRACING_WORKERS,
+  FLOW_TRACING_OVERALL_TIMEOUT_MS,
   getFlowTracingDir,
   getFlowTracingReportPath,
 } from "../utils/constants.js";
@@ -85,9 +86,34 @@ export class FlowTracer {
     const flowSpecsPath = path.join(flowDir, `flows-cycle-${cycle}.json`);
     await fs.writeFile(flowSpecsPath, JSON.stringify(flows, null, 2) + "\n", "utf-8");
 
-    // Step 3: Trace flows in parallel (bounded concurrency)
+    // Step 3: Trace flows in parallel (bounded concurrency) with overall timeout
     this.logger.info(`Flow-tracing: spawning workers (max ${MAX_FLOW_TRACING_WORKERS} concurrent)...`);
-    const allFindings = await this.traceFlowsConcurrently(flows, changedFiles, config);
+
+    // Create timeout promise to enforce 30-minute overall deadline
+    const timeoutPromise = new Promise<"timeout">((resolve) => {
+      const timer = setTimeout(() => resolve("timeout"), FLOW_TRACING_OVERALL_TIMEOUT_MS);
+      // Unref timer so it doesn't prevent process exit
+      if (timer.unref) {
+        timer.unref();
+      }
+    });
+
+    const tracingPromise = this.traceFlowsConcurrently(flows, changedFiles, config);
+    const raceResult = await Promise.race([
+      tracingPromise.then((findings) => ({ type: "success" as const, findings })),
+      timeoutPromise.then(() => ({ type: "timeout" as const })),
+    ]);
+
+    let allFindings: FlowFinding[];
+    if (raceResult.type === "timeout") {
+      this.logger.warn(
+        `Flow-tracing overall timeout exceeded (${FLOW_TRACING_OVERALL_TIMEOUT_MS / 60000} minutes). Returning partial results.`,
+      );
+      // Return empty array on timeout - partial results from individual flows may still be in progress
+      allFindings = [];
+    } else {
+      allFindings = raceResult.findings;
+    }
 
     // Step 4: Deduplicate findings
     const deduplicated = this.deduplicateFindings(allFindings);
@@ -524,7 +550,8 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
         lines.push("");
         lines.push(`- **Flow:** ${finding.flow_id}`);
         lines.push(`- **Actor:** ${finding.actor}`);
-        lines.push(`- **File:** \`${finding.file_path}${finding.line_number ? `:${finding.line_number}` : ""}\``);
+        // Use !== null && !== undefined to handle line_number=0 correctly (#26f)
+        lines.push(`- **File:** \`${finding.file_path}${finding.line_number !== null && finding.line_number !== undefined ? `:${finding.line_number}` : ""}\``);
         if (finding.cross_boundary) {
           lines.push(`- **Cross-Boundary:** Yes`);
         }

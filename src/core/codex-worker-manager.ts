@@ -13,6 +13,7 @@ import {
   MESSAGES_DIR,
   SESSIONS_DIR,
   SESSION_STATUS_FILE,
+  MAX_BUFFER_SIZE_BYTES,
 } from "../utils/constants.js";
 import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
@@ -197,6 +198,26 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     return events;
   }
 
+  /**
+   * Check worker health. CodexWorkerManager does not currently support
+   * timeout/heartbeat tracking, so this always returns empty arrays.
+   * Codex workers manage their own timeouts externally.
+   */
+  checkWorkerHealth(): { timedOut: string[]; stale: string[] } {
+    // Codex workers don't have built-in timeout/heartbeat tracking
+    // They rely on external process management
+    return { timedOut: [], stale: [] };
+  }
+
+  /**
+   * Get retry tracker. CodexWorkerManager does not currently support
+   * retry tracking, so this returns null.
+   */
+  getRetryTracker(): null {
+    // Codex workers don't support retry tracking yet
+    return null;
+  }
+
   private async initializeSessionStatus(sessionId: string, progress: string): Promise<void> {
     const sessionDir = path.join(this.orchestratorDir, SESSIONS_DIR, sessionId);
     await fs.mkdir(sessionDir, { recursive: true });
@@ -333,7 +354,20 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     onLine: (line: string) => void,
     flushRemainder = false,
   ): string {
-    const normalized = buffer.replace(/\r\n/g, "\n");
+    // Buffer size check to prevent memory exhaustion from large Codex outputs
+    // If buffer exceeds MAX_BUFFER_SIZE_BYTES (10MB), truncate to last half
+    let truncatedBuffer = buffer;
+    const bufferSizeBytes = Buffer.byteLength(buffer, "utf-8");
+    if (bufferSizeBytes > MAX_BUFFER_SIZE_BYTES) {
+      this.logger.warn(
+        `Codex output buffer exceeded ${MAX_BUFFER_SIZE_BYTES} bytes (${bufferSizeBytes} bytes). Truncating to preserve recent output.`,
+      );
+      // Truncate to last half (O(1) slice operation as specified in performance requirements)
+      const halfLength = Math.floor(buffer.length / 2);
+      truncatedBuffer = buffer.slice(halfLength);
+    }
+
+    const normalized = truncatedBuffer.replace(/\r\n/g, "\n");
     const lines = normalized.split("\n");
     const remainder = flushRemainder ? "" : (lines.pop() ?? "");
 

@@ -7,10 +7,12 @@ export interface ProviderRateLimitSignal {
 }
 
 const RATE_LIMIT_PATTERNS = [
-  /you['‘’]ve hit your limit/i,
+  /you[''']ve hit your limit/i,
   /rate limit exceeded/i,
   /rate[ _-]?limited/i,
   /\b429\b/,
+  /HTTP 429/i,
+  /status:\s*429/i,
   /too many requests/i,
   /quota exceeded/i,
   /usage limit reached/i,
@@ -37,7 +39,17 @@ export function coerceLogText(value: unknown): string {
 export function detectProviderRateLimit(
   provider: WorkerRuntime,
   detail: string,
+  httpStatusCode?: number,
 ): ProviderRateLimitSignal | null {
+  // Check HTTP status code first (most reliable)
+  if (httpStatusCode === 429) {
+    return {
+      provider,
+      detail: detail || "HTTP 429 Too Many Requests",
+      resetsAt: detail ? extractResetHint(detail) : null,
+    };
+  }
+
   if (!detail) {
     return null;
   }

@@ -9,6 +9,7 @@ import {
   USAGE_API_URL,
   USAGE_API_BETA_HEADER,
   RESUME_UTILIZATION_THRESHOLD,
+  USAGE_MONITOR_MAX_RETRIES,
 } from "../utils/constants.js";
 import type {
   ProviderUsageMonitor,
@@ -17,6 +18,11 @@ import type {
   OAuthCredentials,
 } from "../utils/types.js";
 import { Logger } from "../utils/logger.js";
+
+// NOTE: Connection pooling / Keep-Alive (#26d)
+// Node.js 20+ native fetch uses undici internally, which has Keep-Alive enabled
+// by default with connection pooling. No additional configuration is needed.
+// See: https://nodejs.org/docs/latest-v20.x/api/globals.html#fetch
 
 const DEFAULT_SNAPSHOT: UsageSnapshot = {
   five_hour: 0,
@@ -67,7 +73,8 @@ export class UsageMonitor implements ProviderUsageMonitor {
       return;
     }
 
-    this.logger.info(
+    // Log configuration at debug level to reduce verbose output (#26e)
+    this.logger.debug(
       `Starting usage monitor (poll every ${this.pollIntervalMs / 1000}s, ` +
       `warn at ${(this.threshold * 100).toFixed(0)}%, critical at ${(this.criticalThreshold * 100).toFixed(0)}%)`
     );
@@ -168,53 +175,87 @@ export class UsageMonitor implements ProviderUsageMonitor {
   /**
    * Force a poll right now. Useful before making decisions.
    * Returns the fresh UsageSnapshot.
+   *
+   * On 429 or network errors, retries with exponential backoff (1s/2s/4s).
+   * Returns cached usage if all retries are exhausted.
    */
   async poll(): Promise<UsageSnapshot> {
-    try {
-      const token = this.readOAuthToken();
-      if (!token) {
-        this.logger.warn("No OAuth token found; returning last known usage");
-        return this.getUsage();
-      }
-
-      const response = await fetch(USAGE_API_URL, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "anthropic-beta": USAGE_API_BETA_HEADER,
-        },
-      });
-
-      if (!response.ok) {
-        this.logger.warn(
-          `Usage API returned ${response.status} ${response.statusText}; returning last known usage`
-        );
-        return this.getUsage();
-      }
-
-      const data = (await response.json()) as UsageApiResponse;
-
-      // API returns utilization as percentage (e.g. 5.0 = 5%).
-      // Internally we use 0-1 range (0.05 = 5%) so thresholds like 0.80 work correctly.
-      this.currentUsage = {
-        five_hour: data.five_hour.utilization / 100,
-        seven_day: data.seven_day.utilization / 100,
-        five_hour_resets_at: data.five_hour.resets_at,
-        seven_day_resets_at: data.seven_day.resets_at,
-        last_checked: new Date().toISOString(),
-      };
-
-      this.logger.debug(
-        `Usage: 5h=${(this.currentUsage.five_hour * 100).toFixed(1)}% ` +
-        `7d=${(this.currentUsage.seven_day * 100).toFixed(1)}%`
-      );
-
-      return this.getUsage();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`Failed to poll usage API: ${message}`);
+    const token = this.readOAuthToken();
+    if (!token) {
+      this.logger.warn("No OAuth token found; returning last known usage");
       return this.getUsage();
     }
+
+    let lastError: string | null = null;
+
+    for (let attempt = 0; attempt < USAGE_MONITOR_MAX_RETRIES; attempt++) {
+      try {
+        const response = await fetch(USAGE_API_URL, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "anthropic-beta": USAGE_API_BETA_HEADER,
+          },
+        });
+
+        // On 429, retry with backoff
+        if (response.status === 429) {
+          const backoffMs = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+          this.logger.warn(
+            `Usage API returned 429 (attempt ${attempt + 1}/${USAGE_MONITOR_MAX_RETRIES}), ` +
+            `retrying in ${backoffMs / 1000}s...`
+          );
+          await sleep(backoffMs);
+          continue;
+        }
+
+        if (!response.ok) {
+          this.logger.warn(
+            `Usage API returned ${response.status} ${response.statusText}; returning last known usage`
+          );
+          return this.getUsage();
+        }
+
+        const data = (await response.json()) as UsageApiResponse;
+
+        // API returns utilization as percentage (e.g. 5.0 = 5%).
+        // Internally we use 0-1 range (0.05 = 5%) so thresholds like 0.80 work correctly.
+        this.currentUsage = {
+          five_hour: data.five_hour.utilization / 100,
+          seven_day: data.seven_day.utilization / 100,
+          five_hour_resets_at: data.five_hour.resets_at,
+          seven_day_resets_at: data.seven_day.resets_at,
+          last_checked: new Date().toISOString(),
+        };
+
+        this.logger.debug(
+          `Usage: 5h=${(this.currentUsage.five_hour * 100).toFixed(1)}% ` +
+          `7d=${(this.currentUsage.seven_day * 100).toFixed(1)}%`
+        );
+
+        return this.getUsage();
+      } catch (err) {
+        // Network error - retry with backoff
+        lastError = err instanceof Error ? err.message : String(err);
+        const backoffMs = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+
+        if (attempt < USAGE_MONITOR_MAX_RETRIES - 1) {
+          this.logger.warn(
+            `Failed to poll usage API (attempt ${attempt + 1}/${USAGE_MONITOR_MAX_RETRIES}): ${lastError}, ` +
+            `retrying in ${backoffMs / 1000}s...`
+          );
+          await sleep(backoffMs);
+        }
+      }
+    }
+
+    // All retries exhausted - return cached usage
+    this.logger.warn(
+      `Usage API poll failed after ${USAGE_MONITOR_MAX_RETRIES} attempts` +
+      (lastError ? `: ${lastError}` : "") +
+      `; returning last known usage`
+    );
+    return this.getUsage();
   }
 
   /**

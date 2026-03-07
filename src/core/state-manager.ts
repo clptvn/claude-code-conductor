@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { lock, unlock } from "proper-lockfile";
 
 import {
   type OrchestratorState,
@@ -10,6 +11,7 @@ import {
   type CycleRecord,
   type UsageSnapshot,
   type CodexUsageMetrics,
+  type TaskRetryTrackerInterface,
 } from "../utils/types.js";
 
 import {
@@ -103,14 +105,58 @@ export class StateManager {
   }
 
   /**
-   * Save current state to disk.
+   * Save current state to disk atomically (write to temp, then rename).
+   * Uses proper-lockfile to prevent concurrent write corruption.
    */
   async save(): Promise<void> {
     if (!this.state) {
       throw new Error("StateManager: no state to save — call initialize() or load() first");
     }
     const statePath = getStatePath(this.projectDir);
-    await fs.writeFile(statePath, JSON.stringify(this.state, null, 2) + "\n", "utf-8");
+    const tmpPath = statePath + ".tmp";
+    const content = JSON.stringify(this.state, null, 2) + "\n";
+
+    // Ensure the directory exists before writing
+    await fs.mkdir(path.dirname(statePath), { recursive: true, mode: 0o700 });
+
+    // Ensure state.json exists before locking (proper-lockfile requires file to exist)
+    try {
+      await fs.access(statePath);
+    } catch {
+      // File doesn't exist, create an empty one with secure permissions
+      await fs.writeFile(statePath, "{}\n", { encoding: "utf-8", mode: 0o600 });
+    }
+
+    let release: (() => Promise<void>) | undefined;
+    try {
+      // Acquire lock with retry configuration and stale detection
+      release = await lock(statePath, {
+        retries: { retries: 5, minTimeout: 100 },
+        stale: 5000, // Consider locks stale after 5 seconds
+      });
+
+      // Write to temp file first with secure permissions (mode 0o600)
+      await fs.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+
+      // Atomic rename (prevents partial writes from being read)
+      await fs.rename(tmpPath, statePath);
+    } finally {
+      // Always release the lock, even if writing fails
+      if (release) {
+        try {
+          await release();
+        } catch {
+          // Lock may already be released if process is dying
+        }
+      }
+
+      // Clean up temp file if it still exists (in case rename failed)
+      try {
+        await fs.unlink(tmpPath);
+      } catch {
+        // Temp file may not exist if rename succeeded
+      }
+    }
   }
 
   /**
@@ -153,6 +199,7 @@ export class StateManager {
 
   /**
    * Create the .conductor/ directory structure.
+   * Uses mode 0o700 for owner-only access (security requirement #15).
    */
   async createDirectories(): Promise<void> {
     const dirs = [
@@ -166,7 +213,7 @@ export class StateManager {
     ];
 
     for (const dir of dirs) {
-      await fs.mkdir(dir, { recursive: true });
+      await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     }
   }
 
@@ -176,6 +223,9 @@ export class StateManager {
 
   /**
    * Create a task from a TaskDefinition and persist it.
+   *
+   * V2: Uses proper-lockfile to lock dependency files during blocks[] mutation
+   * to prevent race condition with concurrent task operations (#8).
    */
   async createTask(
     definition: TaskDefinition,
@@ -198,20 +248,58 @@ export class StateManager {
       created_at: now,
       started_at: null,
       completed_at: null,
+      task_type: definition.task_type,
+      security_requirements: definition.security_requirements,
+      performance_requirements: definition.performance_requirements,
+      acceptance_criteria: definition.acceptance_criteria,
+      risk_level: definition.risk_level,
     };
 
-    // Write the task file
+    // Write the task file with secure permissions (mode 0o600)
     const taskPath = getTaskPath(this.projectDir, id);
-    await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", "utf-8");
+    await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
 
     // Now compute `blocks` for all existing tasks:
     // If this new task depends on task X, then task X blocks this new task.
+    // Lock each dependency file to prevent race conditions during mutation.
     for (const depId of dependencyIds) {
-      const depTask = await this.getTask(depId);
-      if (depTask && !depTask.blocks.includes(id)) {
-        depTask.blocks.push(id);
-        const depPath = getTaskPath(this.projectDir, depId);
-        await fs.writeFile(depPath, JSON.stringify(depTask, null, 2) + "\n", "utf-8");
+      const depPath = getTaskPath(this.projectDir, depId);
+
+      // Verify file exists before trying to lock
+      try {
+        await fs.access(depPath);
+      } catch {
+        // Dependency file doesn't exist, skip
+        continue;
+      }
+
+      let release: (() => Promise<void>) | undefined;
+      try {
+        release = await lock(depPath, {
+          retries: { retries: 5, minTimeout: 100 },
+          stale: 5000,
+        });
+
+        // Re-read after lock acquisition (double-check pattern)
+        const depTask = await this.getTask(depId);
+        if (depTask && !depTask.blocks.includes(id)) {
+          depTask.blocks.push(id);
+          await fs.writeFile(depPath, JSON.stringify(depTask, null, 2) + "\n", {
+            encoding: "utf-8",
+            mode: 0o600,
+          });
+        }
+      } finally {
+        if (release) {
+          try {
+            await release();
+          } catch {
+            // Lock may already be released
+          }
+        }
       }
     }
 
@@ -265,26 +353,98 @@ export class StateManager {
   /**
    * Reset orphaned tasks: any task that is in_progress but whose owner
    * is not in the set of active worker session IDs gets reset to pending.
-   * Returns the number of tasks reset.
+   *
+   * V2: If a TaskRetryTracker is provided, uses it to:
+   * - Check if the task should be retried
+   * - Mark tasks as failed if retries are exhausted
+   * - Persist retry_count and last_error to the task file
+   *
+   * V3: Uses proper-lockfile to prevent race condition with claim_task (#8).
+   * Each task file is locked before mutation with double-check pattern.
+   *
+   * Returns { resetCount: number, exhaustedCount: number }
    */
-  async resetOrphanedTasks(activeSessionIds: string[]): Promise<number> {
+  async resetOrphanedTasks(
+    activeSessionIds: string[],
+    retryTracker?: TaskRetryTrackerInterface,
+  ): Promise<{ resetCount: number; exhaustedCount: number }> {
     const activeSet = new Set(activeSessionIds);
     const inProgressTasks = await this.getTasksByStatus("in_progress");
     let resetCount = 0;
+    let exhaustedCount = 0;
 
     for (const task of inProgressTasks) {
       if (task.owner && !activeSet.has(task.owner)) {
-        // Owner is no longer active — reset task
-        task.status = "pending";
-        task.owner = null;
-        task.started_at = null;
         const taskPath = getTaskPath(this.projectDir, task.id);
-        await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", "utf-8");
-        resetCount++;
+
+        // Acquire lock on task file to prevent race with claim_task
+        let release: (() => Promise<void>) | undefined;
+        try {
+          release = await lock(taskPath, {
+            retries: { retries: 5, minTimeout: 100 },
+            stale: 5000,
+          });
+
+          // Double-check pattern: Re-read task after lock acquisition
+          // Another process may have claimed or modified it
+          const freshTask = await this.getTask(task.id);
+          if (!freshTask) {
+            // Task file was deleted, skip
+            continue;
+          }
+
+          // Skip if task state changed (e.g., was claimed by another worker)
+          if (freshTask.status !== "in_progress") {
+            continue;
+          }
+
+          // Skip if task is now owned by an active session
+          if (freshTask.owner && activeSet.has(freshTask.owner)) {
+            continue;
+          }
+
+          // Owner is no longer active — check if we should retry
+          if (retryTracker && !retryTracker.shouldRetry(freshTask.id)) {
+            // Exhausted retries — mark as failed
+            freshTask.status = "failed";
+            freshTask.completed_at = new Date().toISOString();
+            freshTask.result_summary = "Exceeded maximum retry attempts";
+            freshTask.retry_count = retryTracker.getRetryCount(freshTask.id);
+            // Convert null to undefined for optional field
+            freshTask.last_error = retryTracker.getLastError(freshTask.id) ?? undefined;
+            exhaustedCount++;
+          } else {
+            // Reset for retry
+            freshTask.status = "pending";
+            freshTask.owner = null;
+            freshTask.started_at = null;
+
+            // V2: Persist retry context to task file
+            if (retryTracker) {
+              freshTask.retry_count = retryTracker.getRetryCount(freshTask.id);
+              // Convert null to undefined for optional field
+              freshTask.last_error = retryTracker.getLastError(freshTask.id) ?? undefined;
+            }
+            resetCount++;
+          }
+
+          await fs.writeFile(taskPath, JSON.stringify(freshTask, null, 2) + "\n", {
+            encoding: "utf-8",
+            mode: 0o600,
+          });
+        } finally {
+          if (release) {
+            try {
+              await release();
+            } catch {
+              // Lock may already be released
+            }
+          }
+        }
       }
     }
 
-    return resetCount;
+    return { resetCount, exhaustedCount };
   }
 
   // ----------------------------------------------------------------
@@ -331,9 +491,25 @@ export class StateManager {
 
   /**
    * Record a completed cycle.
+   * Validates CycleRecord required fields (#26g).
    */
   async recordCycle(record: CycleRecord): Promise<void> {
     this.ensureState();
+
+    // Validate required CycleRecord fields (#26g)
+    if (typeof record.cycle !== "number" || record.cycle < 1) {
+      throw new Error(`Invalid CycleRecord: cycle must be a positive number, got ${record.cycle}`);
+    }
+    if (typeof record.plan_version !== "number" || record.plan_version < 1) {
+      throw new Error(`Invalid CycleRecord: plan_version must be a positive number, got ${record.plan_version}`);
+    }
+    if (typeof record.duration_ms !== "number" || record.duration_ms < 0) {
+      throw new Error(`Invalid CycleRecord: duration_ms must be a non-negative number, got ${record.duration_ms}`);
+    }
+    if (!record.started_at || !record.completed_at) {
+      throw new Error(`Invalid CycleRecord: started_at and completed_at are required`);
+    }
+
     this.state!.cycle_history.push(record);
     this.state!.current_cycle = record.cycle;
     this.touch();

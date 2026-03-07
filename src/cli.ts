@@ -4,8 +4,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import chalk from "chalk";
+import { lock, unlock, check } from "proper-lockfile";
 
 import { Orchestrator } from "./core/orchestrator.js";
+import { EventLog } from "./core/event-log.js";
 import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime } from "./utils/types.js";
 import {
   getStatePath,
@@ -13,7 +15,10 @@ import {
   getOrchestratorDir,
   getTasksDir,
   getPauseSignalPath,
+  getCliLockPath,
+  CLI_LOCK_STALE_TIMEOUT_MS,
 } from "./utils/constants.js";
+import { validateBounds } from "./utils/validation.js";
 
 // ============================================================
 // Helpers
@@ -80,6 +85,140 @@ function parseWorkerRuntime(value: string): WorkerRuntime {
   );
 }
 
+// ============================================================
+// Process Lock Helpers (#10)
+// ============================================================
+
+interface LockInfo {
+  pid: number;
+  timestamp: string;
+}
+
+/**
+ * Check if a process with the given PID is still running.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    // Sending signal 0 doesn't kill the process, just checks if it exists
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Acquire a process-level lock to prevent concurrent CLI invocations.
+ * Returns a release function that must be called in a finally block.
+ *
+ * @throws Error if lock is already held by another active process
+ */
+async function acquireProcessLock(projectDir: string): Promise<() => Promise<void>> {
+  const lockPath = getCliLockPath(projectDir);
+  const lockInfoPath = lockPath + ".info";
+  const orchestratorDir = getOrchestratorDir(projectDir);
+
+  // Ensure .conductor directory exists
+  await fs.mkdir(orchestratorDir, { recursive: true, mode: 0o700 });
+
+  // Create lock file if it doesn't exist (required by proper-lockfile)
+  try {
+    await fs.access(lockPath);
+  } catch {
+    await fs.writeFile(lockPath, "", { mode: 0o600 });
+  }
+
+  // Check if lock is already held
+  const isLocked = await check(lockPath, { stale: CLI_LOCK_STALE_TIMEOUT_MS });
+
+  if (isLocked) {
+    // Check if the holding process is still alive by reading the .info file
+    try {
+      const infoContent = await fs.readFile(lockInfoPath, "utf-8");
+      const info: LockInfo = JSON.parse(infoContent);
+
+      // Check if process is dead (PID-based stale detection)
+      if (!isProcessAlive(info.pid)) {
+        console.log(chalk.yellow(`Cleaning up stale lock from dead process ${info.pid}...`));
+        // Force remove the stale lock
+        try {
+          await unlock(lockPath);
+        } catch {
+          // Lock may not be held properly, just continue
+        }
+        try {
+          await fs.unlink(lockInfoPath);
+        } catch {
+          // Info file may not exist
+        }
+        // Continue to acquire lock below
+      } else {
+        // Check if lock is older than stale timeout
+        const lockTime = new Date(info.timestamp).getTime();
+        const elapsed = Date.now() - lockTime;
+
+        if (elapsed > CLI_LOCK_STALE_TIMEOUT_MS) {
+          console.log(chalk.yellow(`Cleaning up stale lock (${Math.round(elapsed / 60000)} minutes old)...`));
+          try {
+            await unlock(lockPath);
+          } catch {
+            // Lock may not be held properly
+          }
+          try {
+            await fs.unlink(lockInfoPath);
+          } catch {
+            // Info file may not exist
+          }
+          // Continue to acquire lock below
+        } else {
+          // Lock is held by an active process
+          throw new Error(
+            `Another conductor process (PID ${info.pid}) is already running.\n` +
+            `Started at: ${info.timestamp}\n` +
+            `If this is stale, wait ${Math.round((CLI_LOCK_STALE_TIMEOUT_MS - elapsed) / 60000)} minutes or kill PID ${info.pid}.`
+          );
+        }
+      }
+    } catch (err) {
+      // If we can't read the info file but lock is held, throw generic error
+      if (err instanceof Error && err.message.includes("Another conductor")) {
+        throw err;
+      }
+      throw new Error(
+        "Another conductor process appears to be running.\n" +
+        "If this is stale, wait up to 1 hour or manually remove .conductor/conductor.lock"
+      );
+    }
+  }
+
+  // Acquire the lock
+  const release = await lock(lockPath, {
+    retries: { retries: 5, minTimeout: 100 },
+    stale: CLI_LOCK_STALE_TIMEOUT_MS
+  });
+
+  // Write lock info file with PID and timestamp
+  const lockInfo: LockInfo = {
+    pid: process.pid,
+    timestamp: new Date().toISOString(),
+  };
+  await fs.writeFile(lockInfoPath, JSON.stringify(lockInfo, null, 2), { mode: 0o600 });
+
+  // Return release function that cleans up both lock and info file
+  return async () => {
+    try {
+      await release();
+    } catch {
+      // Lock may already be released
+    }
+    try {
+      await fs.unlink(lockInfoPath);
+    } catch {
+      // Info file may already be removed
+    }
+  };
+}
+
 function printUsageSnapshot(label: string, usage: UsageSnapshot): void {
   console.log(chalk.white(`${label}:`));
   console.log(chalk.white(`      5-hour:       ${(usage.five_hour * 100).toFixed(1)}%`));
@@ -99,7 +238,7 @@ const program = new Command();
 program
   .name("conduct")
   .description("Claude Code Conductor -- hierarchical multi-agent orchestration for large features")
-  .version("0.1.5");
+  .version("0.2.0");
 
 // ============================================================
 // start command
@@ -123,12 +262,26 @@ program
   .action(async (feature: string, opts: Record<string, string | boolean | undefined>) => {
     const projectDir = path.resolve(opts.project as string);
 
+    // Parse numeric options
+    const concurrency = parseInt(opts.concurrency as string, 10) || 2;
+    const maxCycles = parseInt(opts.maxCycles as string, 10) || 5;
+    const usageThreshold = parseFloat(opts.usageThreshold as string) || 0.8;
+
+    // Validate bounds for CLI parameters (#20 - security: reject extreme values)
+    try {
+      validateBounds("concurrency", concurrency, 1, 10);
+      validateBounds("maxCycles", maxCycles, 1, 20);
+      validateBounds("usageThreshold", usageThreshold, 0.1, 1.0);
+    } catch (err) {
+      throw new InvalidArgumentError(err instanceof Error ? err.message : String(err));
+    }
+
     const options: CLIOptions = {
       project: projectDir,
       feature,
-      concurrency: parseInt(opts.concurrency as string, 10) || 2,
-      maxCycles: parseInt(opts.maxCycles as string, 10) || 5,
-      usageThreshold: parseFloat(opts.usageThreshold as string) || 0.8,
+      concurrency,
+      maxCycles,
+      usageThreshold,
       skipCodex: Boolean(opts.skipCodex),
       skipFlowReview: Boolean(opts.skipFlowReview),
       dryRun: Boolean(opts.dryRun),
@@ -140,13 +293,41 @@ program
       forceResume: false,
     };
 
+    // Acquire process lock to prevent concurrent invocations (#10)
+    let releaseLock: (() => Promise<void>) | undefined;
+    try {
+      releaseLock = await acquireProcessLock(projectDir);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`\nCannot start conductor: ${message}\n`));
+      process.exit(1);
+    }
+
     try {
       const orchestrator = new Orchestrator(options);
+
+      // Graceful shutdown on SIGINT/SIGTERM (#19)
+      const shutdown = async () => {
+        console.log('\nGraceful shutdown initiated...');
+        try {
+          await orchestrator.shutdown();
+        } catch {
+          // Best effort
+        }
+        process.exit(0);
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+
       await orchestrator.run();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nConductor failed: ${message}\n`));
       process.exit(1);
+    } finally {
+      if (releaseLock) {
+        await releaseLock();
+      }
     }
   });
 
@@ -269,8 +450,78 @@ program
             `code ${codeApproved}${flowInfo}, ${duration}`,
           ),
         );
+        // Phase durations breakdown
+        if (cycle.phase_durations) {
+          const pd = cycle.phase_durations;
+          const parts: string[] = [];
+          if (pd.planning_ms) parts.push(`plan: ${formatDuration(pd.planning_ms)}`);
+          if (pd.conventions_ms) parts.push(`conventions: ${formatDuration(pd.conventions_ms)}`);
+          if (pd.execution_ms) parts.push(`exec: ${formatDuration(pd.execution_ms)}`);
+          if (pd.code_review_ms) parts.push(`review: ${formatDuration(pd.code_review_ms)}`);
+          if (pd.flow_tracing_ms) parts.push(`flow: ${formatDuration(pd.flow_tracing_ms)}`);
+          if (parts.length > 0) {
+            console.log(chalk.gray(`             Phases: ${parts.join(", ")}`));
+          }
+        }
+        // Blast radius summary
+        if (cycle.blast_radius) {
+          const br = cycle.blast_radius;
+          const brInfo = `${br.files_changed} files, +${br.lines_added}/-${br.lines_removed} lines`;
+          const warningCount = br.warnings.length > 0 ? chalk.yellow(` (${br.warnings.length} warning(s))`) : "";
+          console.log(chalk.gray(`             Blast radius: ${brInfo}${warningCount}`));
+        }
       }
       console.log("");
+    }
+
+    // Event analytics
+    try {
+      const eventLog = new EventLog(projectDir);
+      const analytics = await eventLog.getAnalytics();
+
+      // Only show if there are events
+      if (analytics.total_events > 0) {
+        console.log(chalk.bold("  Event Analytics:"));
+
+        // Phase durations
+        if (Object.keys(analytics.phase_durations).length > 0) {
+          console.log(chalk.white("    Average Phase Durations:"));
+          for (const [phase, stats] of Object.entries(analytics.phase_durations)) {
+            const avgSec = Math.round(stats.avg_ms / 1000);
+            console.log(chalk.gray(`      ${phase}: ${avgSec}s avg (${stats.count} runs)`));
+          }
+        }
+
+        // Worker success rate
+        if (analytics.total_workers > 0) {
+          const successColor = analytics.worker_success_rate >= 80 ? chalk.green : chalk.yellow;
+          console.log(
+            chalk.white("    Worker Success Rate: ") +
+            successColor(`${analytics.worker_success_rate}%`)
+          );
+        }
+
+        // Task retry rate - only show if > 0
+        if (analytics.task_retry_rate > 0) {
+          console.log(
+            chalk.white("    Task Retry Rate: ") +
+            chalk.yellow(`${analytics.task_retry_rate}%`)
+          );
+        }
+
+        // Top bottleneck tasks (top 3)
+        if (analytics.top_bottleneck_tasks.length > 0) {
+          console.log(chalk.white("    Top Bottleneck Tasks:"));
+          for (const task of analytics.top_bottleneck_tasks.slice(0, 3)) {
+            const durationMin = Math.round(task.duration_ms / 60000);
+            console.log(chalk.gray(`      ${task.task_id}: ${durationMin}m`));
+          }
+        }
+
+        console.log("");
+      }
+    } catch {
+      // Event log may not exist yet - that's fine
     }
 
     // Task details
@@ -385,13 +636,41 @@ program
       forceResume,
     };
 
+    // Acquire process lock to prevent concurrent invocations (#10)
+    let releaseLock: (() => Promise<void>) | undefined;
+    try {
+      releaseLock = await acquireProcessLock(projectDir);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`\nCannot resume conductor: ${message}\n`));
+      process.exit(1);
+    }
+
     try {
       const orchestrator = new Orchestrator(options);
+
+      // Graceful shutdown on SIGINT/SIGTERM (#19)
+      const shutdown = async () => {
+        console.log('\nGraceful shutdown initiated...');
+        try {
+          await orchestrator.shutdown();
+        } catch {
+          // Best effort
+        }
+        process.exit(0);
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+
       await orchestrator.run();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nResume failed: ${message}\n`));
       process.exit(1);
+    } finally {
+      if (releaseLock) {
+        await releaseLock();
+      }
     }
   });
 
@@ -428,7 +707,7 @@ program
       requested_at: new Date().toISOString(),
       requested_by: "user",
     };
-    await fs.writeFile(signalPath, JSON.stringify(signal, null, 2) + "\n", "utf-8");
+    await fs.writeFile(signalPath, JSON.stringify(signal, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
 
     console.log(chalk.yellow("\n  Pause signal sent."));
     console.log(chalk.yellow("  The conductor will pause after current workers finish their tasks."));

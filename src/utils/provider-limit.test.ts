@@ -41,4 +41,54 @@ describe("detectProviderRateLimit", () => {
   it("ignores ordinary errors", () => {
     expect(detectProviderRateLimit("codex", "command failed with exit code 1")).toBeNull();
   });
+
+  it("detects HTTP 429 pattern in message", () => {
+    expect(
+      detectProviderRateLimit("claude", "Error: HTTP 429 returned from API"),
+    ).toMatchObject({
+      provider: "claude",
+    });
+  });
+
+  it("detects status: 429 pattern in message", () => {
+    expect(
+      detectProviderRateLimit("claude", "Request failed with status: 429"),
+    ).toMatchObject({
+      provider: "claude",
+    });
+  });
+
+  it("detects rate limit via httpStatusCode parameter", () => {
+    expect(
+      detectProviderRateLimit("claude", "", 429),
+    ).toMatchObject({
+      provider: "claude",
+      detail: "HTTP 429 Too Many Requests",
+    });
+  });
+
+  it("prioritizes httpStatusCode over pattern matching", () => {
+    // Even with a non-rate-limit message, 429 status code should trigger detection
+    expect(
+      detectProviderRateLimit("claude", "some random error", 429),
+    ).toMatchObject({
+      provider: "claude",
+      detail: "some random error",
+    });
+  });
+
+  it("extracts reset hint with httpStatusCode", () => {
+    expect(
+      detectProviderRateLimit("claude", "retry after 2026-03-06T15:00:00.000Z", 429),
+    ).toMatchObject({
+      provider: "claude",
+      resetsAt: "2026-03-06T15:00:00.000Z",
+    });
+  });
+
+  it("does not trigger on non-429 status codes", () => {
+    expect(
+      detectProviderRateLimit("claude", "some error", 500),
+    ).toBeNull();
+  });
 });

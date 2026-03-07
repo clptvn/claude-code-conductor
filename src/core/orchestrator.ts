@@ -12,19 +12,19 @@ import type {
   CLIOptions,
   ExecutionWorkerManager,
   CycleRecord,
-  CodexVerdict,
+  PhaseDurations,
+  BlastRadius,
   FlowTracingReport,
-  FlowTracingSummary,
   PlannerOutput,
   Task,
   TaskDefinition,
   ProjectConventions,
   ThreatModel,
   KnownIssue,
-  FlowFinding,
   ProviderUsageMonitor,
   UsageSnapshot,
   WorkerRuntime,
+  ProjectProfile,
 } from "../utils/types.js";
 
 import {
@@ -36,12 +36,13 @@ import {
   getCodexReviewsDir,
   getEscalationPath,
   getPauseSignalPath,
-  getKnownIssuesPath,
   MAX_PLAN_DISCUSSION_ROUNDS,
   MAX_CODE_REVIEW_ROUNDS,
   MAX_DISAGREEMENT_ROUNDS,
   DEFAULT_WORKER_POLL_INTERVAL_MS,
   WIND_DOWN_GRACE_PERIOD_MS,
+  DEFAULT_WORKER_TIMEOUT_MS,
+  GRACEFUL_SHUTDOWN_TIMEOUT_MS,
 } from "../utils/constants.js";
 
 import { Logger } from "../utils/logger.js";
@@ -56,8 +57,24 @@ import { CodexWorkerManager } from "./codex-worker-manager.js";
 import { FlowTracer } from "./flow-tracer.js";
 import { extractConventions } from "../utils/conventions-extractor.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
-import { runSemgrep } from "../utils/semgrep-runner.js";
-import { loadKnownIssues, addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
+import { addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
+import {
+  detectProject,
+  loadCachedProfile,
+  cacheProfile,
+  formatProjectGuidance,
+} from "./project-detector.js";
+import {
+  EventLog,
+  recordPhaseStart,
+  recordPhaseEnd,
+  recordWorkerSpawn,
+  recordWorkerFail,
+  recordWorkerTimeout,
+  recordReviewVerdict,
+  recordUsageWarning,
+  recordProjectDetection,
+} from "./event-log.js";
 
 // ============================================================
 // Helpers
@@ -91,6 +108,9 @@ export class Orchestrator {
   private logger: Logger;
   private options: CLIOptions;
 
+  // V2: Structured event logging
+  private eventLog: EventLog;
+
   // Stores the Q&A context gathered during initialization
   private qaContext: string = "";
 
@@ -98,6 +118,9 @@ export class Orchestrator {
   private conventions: ProjectConventions | null = null;
   private projectRules: string = "";
   private threatModel: ThreatModel | null = null;
+
+  // V2: Auto-detected project profile
+  private projectProfile: ProjectProfile | null = null;
 
   // Stores any user redirect guidance gathered during escalation
   private redirectGuidance: string | null = null;
@@ -195,6 +218,9 @@ export class Orchestrator {
         );
 
     this.flowTracer = new FlowTracer(options.project, this.logger);
+
+    // V2: Initialize event logging
+    this.eventLog = new EventLog(options.project);
   }
 
   // ================================================================
@@ -202,6 +228,9 @@ export class Orchestrator {
   // ================================================================
 
   async run(): Promise<void> {
+    // V2: Start event logging
+    this.eventLog.start();
+
     try {
       await this.initialize();
 
@@ -233,6 +262,10 @@ export class Orchestrator {
       }
 
       while (state.current_cycle < state.max_cycles) {
+        // Clear stale orchestrator messages from previous cycles to avoid
+        // workers picking up old wind_down signals at the start of a new cycle
+        await this.clearStaleOrchestratorMessages();
+
         const cycleStart = Date.now();
         const cycleNum = state.current_cycle + 1;
 
@@ -240,12 +273,18 @@ export class Orchestrator {
         this.logger.info(`  CYCLE ${cycleNum} of ${state.max_cycles}`);
         this.logger.info(`${"=".repeat(60)}\n`);
 
+        // Phase timing tracker
+        const phaseDurations: PhaseDurations = {};
+
         // Phase 1: Planning (skip on resume if tasks already exist)
         if (skipPlanningThisCycle) {
           skipPlanningThisCycle = false; // only skip once
+          phaseDurations.planning_ms = 0; // Set to 0 when skipped (#26h)
           this.logger.info("Skipping planning phase (resuming with existing tasks).");
         } else {
+          const planStart = Date.now();
           planVersion = await this.plan(planVersion, cycleNum > 1);
+          phaseDurations.planning_ms = Date.now() - planStart;
         }
 
         // If dry run, print plan and exit
@@ -264,6 +303,7 @@ export class Orchestrator {
         }
 
         // Extract project conventions (pre-execution phase)
+        const conventionsStart = Date.now();
         await this.state.setProgress("Conventions: extracting project patterns...");
         await logProgress(this.options.project, "conventions", "Extracting project patterns");
         this.logger.info("Extracting project conventions...");
@@ -273,6 +313,7 @@ export class Orchestrator {
         }
         this.conventions = await extractConventions(this.options.project);
         this.projectRules = await loadWorkerRules(this.options.project);
+        phaseDurations.conventions_ms = Date.now() - conventionsStart;
 
         // Pass context to worker manager
         this.workers.setWorkerContext({
@@ -283,10 +324,16 @@ export class Orchestrator {
           threatModelSummary: this.threatModel
             ? this.formatThreatModelForWorkers(this.threatModel)
             : undefined,
+          // V2: Auto-detected project guidance
+          projectGuidance: this.projectProfile
+            ? formatProjectGuidance(this.projectProfile)
+            : undefined,
         });
 
         // Phase 2: Execution
+        const executionStart = Date.now();
         await this.execute();
+        phaseDurations.execution_ms = Date.now() - executionStart;
 
         if (this.state.get().status === "paused") {
           return;
@@ -320,9 +367,12 @@ export class Orchestrator {
         }
 
         // Phase 3: Code review and flow tracing in parallel (both are read-only)
+        // Use separate start timestamps for accurate per-phase duration tracking
+        const reviewStart = Date.now();
+        const flowStart = Date.now();
         const [approved, flowReport] = await Promise.all([
-          this.review(),
-          this.flowReview(cycleNum),
+          this.review().then((r) => { phaseDurations.code_review_ms = Date.now() - reviewStart; return r; }),
+          this.flowReview(cycleNum).then((r) => { phaseDurations.flow_tracing_ms = Date.now() - flowStart; return r; }),
         ]);
 
 
@@ -339,7 +389,9 @@ export class Orchestrator {
         }
 
         // Phase 4: Checkpoint
+        const checkpointStart = Date.now();
         let result = await this.checkpoint();
+        phaseDurations.checkpoint_ms = Date.now() - checkpointStart;
 
         // If flow tracing found critical/high issues, force another cycle
         if (flowReport && (flowReport.summary.critical > 0 || flowReport.summary.high > 0)) {
@@ -361,6 +413,15 @@ export class Orchestrator {
         const completedTasks = await this.state.getTasksByStatus("completed");
         const failedTasks = await this.state.getTasksByStatus("failed");
 
+        // Log phase durations
+        this.logger.info("Phase durations: " + Object.entries(phaseDurations)
+          .filter(([, v]) => v !== undefined)
+          .map(([k, v]) => `${k.replace("_ms", "")}: ${Math.round(v! / 1000)}s`)
+          .join(", "));
+
+        // Compute blast radius from completed tasks
+        const blastRadius = await this.computeBlastRadius(completedTasks);
+
         const cycleRecord: CycleRecord = {
           cycle: cycleNum,
           plan_version: planVersion,
@@ -376,6 +437,8 @@ export class Orchestrator {
           flow_tracing: flowReport
             ? FlowTracer.toSummary(flowReport, flowReport.summary.total > 0 ? Date.now() - cycleStart : 0)
             : undefined,
+          phase_durations: phaseDurations,
+          blast_radius: blastRadius,
         };
         await this.state.recordCycle(cycleRecord);
 
@@ -417,8 +480,9 @@ export class Orchestrator {
           // "continue" falls through to next cycle
         }
 
-        // Increment cycle
+        // Increment cycle and persist immediately to ensure it survives crashes
         state.current_cycle = cycleNum;
+        await this.state.save();
       }
 
       // Exhausted all cycles
@@ -433,6 +497,9 @@ export class Orchestrator {
         // Best effort
       }
       throw err;
+    } finally {
+      // V2: Stop event logging and flush remaining events
+      await this.eventLog.stop();
     }
   }
 
@@ -441,6 +508,9 @@ export class Orchestrator {
   // ================================================================
 
   private async initialize(): Promise<void> {
+    const initStartTime = Date.now();
+    recordPhaseStart(this.eventLog, "initialize");
+
     this.logger.info("Initializing conductor...");
     await logProgress(this.options.project, "initializing", "Creating directory structure");
 
@@ -488,6 +558,16 @@ export class Orchestrator {
 
       await this.ensureExecutionRuntimeAvailable();
       await this.clearPauseSignalIfPresent(this.options.forceResume ? "force-resume" : "resume");
+
+      // V2: Load cached project profile on resume
+      try {
+        this.projectProfile = await loadCachedProfile(this.options.project);
+        if (this.projectProfile) {
+          this.logger.info(`Loaded cached project profile from ${this.projectProfile.detected_at}`);
+        }
+      } catch (err) {
+        this.logger.warn(`Failed to load cached project profile: ${err instanceof Error ? err.message : String(err)}`);
+      }
 
       if (!this.options.skipCodex) {
         await this.setupCodexMcpConfig();
@@ -567,6 +647,30 @@ export class Orchestrator {
 
     await this.ensureExecutionRuntimeAvailable();
 
+    // V2: Project auto-detection
+    await this.state.setProgress("Initializing: detecting project configuration...");
+    await logProgress(this.options.project, "initializing", "Detecting project configuration");
+
+    try {
+      // Try to load cached profile first
+      this.projectProfile = await loadCachedProfile(this.options.project);
+
+      if (!this.projectProfile) {
+        // No cache - run detection
+        this.logger.info("Running project auto-detection...");
+        this.projectProfile = await detectProject(this.options.project);
+        await cacheProfile(this.options.project, this.projectProfile);
+        this.logger.info(
+          `Detected: ${this.projectProfile.languages.join(", ")} project with ${this.projectProfile.frameworks.join(", ") || "no frameworks"}`
+        );
+      } else {
+        this.logger.info(`Loaded cached project profile from ${this.projectProfile.detected_at}`);
+      }
+    } catch (err) {
+      this.logger.warn(`Project detection failed: ${err instanceof Error ? err.message : String(err)}`);
+      // Continue without project guidance
+    }
+
     // Print welcome banner
     this.printBanner();
 
@@ -597,6 +701,12 @@ export class Orchestrator {
     // Set up Codex MCP config so Codex can access the coordination server
     await this.setupCodexMcpConfig();
 
+    // V2: Record phase completion and project detection
+    recordPhaseEnd(this.eventLog, "initialize", initStartTime);
+    if (this.projectProfile) {
+      recordProjectDetection(this.eventLog, this.projectProfile);
+    }
+
     this.logger.info("Initialization complete.");
   }
 
@@ -614,7 +724,7 @@ export class Orchestrator {
     const conductorDir = path.resolve(getOrchestratorDir(this.options.project));
 
     const configDir = path.join(this.options.project, ".codex");
-    await fs.mkdir(configDir, { recursive: true });
+    await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
 
     const toml = [
       "[mcp_servers.coordinator]",
@@ -629,8 +739,8 @@ export class Orchestrator {
     ].join("\n");
 
     const configPath = path.join(configDir, "config.toml");
-    await fs.writeFile(configPath, toml, "utf-8");
-    this.logger.info(`Codex MCP config written to ${configPath}`);
+    await fs.writeFile(configPath, toml, { encoding: "utf-8", mode: 0o600 });
+    this.logger.debug(`Codex MCP config written to ${configPath}`);
   }
 
   private async ensureExecutionRuntimeAvailable(): Promise<void> {
@@ -710,6 +820,9 @@ export class Orchestrator {
   // ================================================================
 
   private async plan(planVersion: number, isReplan: boolean): Promise<number> {
+    const planStartTime = Date.now();
+    recordPhaseStart(this.eventLog, "planning");
+
     await this.state.setStatus("planning");
     await this.state.setProgress(`Planning: generating plan v${planVersion}...`);
     await logProgress(this.options.project, "planning", `Generating plan v${planVersion} (replan=${isReplan})`);
@@ -780,13 +893,6 @@ export class Orchestrator {
 
         let discussionRound = 0;
         const issueCounts = new Map<string, number>();
-
-        // If Codex errored, log clearly and proceed without review
-        if (reviewResult.verdict === "ERROR") {
-          this.logger.error(
-            `Codex plan review FAILED: ${reviewResult.raw_output}. Proceeding without plan review.`,
-          );
-        }
 
         while (
           reviewResult.verdict !== "APPROVE" &&
@@ -870,7 +976,7 @@ export class Orchestrator {
           }
 
           // Save the response
-          await fs.writeFile(responsePath, responseText, "utf-8");
+          await fs.writeFile(responsePath, responseText, { encoding: "utf-8", mode: 0o600 });
           this.logger.debug(`Discussion response saved to ${responsePath}`);
 
           // Re-review with the response
@@ -931,6 +1037,47 @@ export class Orchestrator {
       subjectToId.set(def.subject, taskId);
     }
 
+    // Validate dependency graph before creating tasks
+    let danglingDeps = 0;
+    for (const def of planOutput.tasks) {
+      for (const depSubject of def.depends_on_subjects) {
+        if (!subjectToId.has(depSubject)) {
+          this.logger.warn(
+            `Task "${def.subject}" depends on unknown subject "${depSubject}"; dependency will be skipped`,
+          );
+          danglingDeps++;
+        }
+      }
+    }
+
+    // Detect dependency cycles
+    const visited = new Set<string>();
+    const inStack = new Set<string>();
+    const hasCycle = (subject: string): boolean => {
+      if (inStack.has(subject)) return true;
+      if (visited.has(subject)) return false;
+      visited.add(subject);
+      inStack.add(subject);
+      const def = planOutput.tasks.find((t) => t.subject === subject);
+      if (def) {
+        for (const dep of def.depends_on_subjects) {
+          if (subjectToId.has(dep) && hasCycle(dep)) return true;
+        }
+      }
+      inStack.delete(subject);
+      return false;
+    };
+    for (const def of planOutput.tasks) {
+      if (hasCycle(def.subject)) {
+        this.logger.warn(`Dependency cycle detected involving task "${def.subject}". Dependencies may be ignored.`);
+        break;
+      }
+    }
+
+    if (danglingDeps > 0) {
+      this.logger.warn(`${danglingDeps} dangling dependency reference(s) detected in plan.`);
+    }
+
     // Second pass: create tasks with resolved dependency IDs
     for (let i = 0; i < planOutput.tasks.length; i++) {
       const def = planOutput.tasks[i];
@@ -941,10 +1088,6 @@ export class Orchestrator {
         const depId = subjectToId.get(depSubject);
         if (depId) {
           dependencyIds.push(depId);
-        } else {
-          this.logger.warn(
-            `Task "${def.subject}" depends on unknown subject "${depSubject}"; skipping dependency`,
-          );
         }
       }
 
@@ -953,6 +1096,10 @@ export class Orchestrator {
     }
 
     this.logger.info(`Created ${planOutput.tasks.length} task(s) from plan.`);
+
+    // V2: Record planning phase completion
+    recordPhaseEnd(this.eventLog, "planning", planStartTime);
+
     return planVersion;
   }
 
@@ -961,6 +1108,9 @@ export class Orchestrator {
   // ================================================================
 
   private async execute(): Promise<void> {
+    const executeStartTime = Date.now();
+    recordPhaseStart(this.eventLog, "executing");
+
     await this.state.setStatus("executing");
     await this.state.setProgress("Executing: preparing workers...");
     await logProgress(this.options.project, "executing", "Preparing workers");
@@ -972,11 +1122,17 @@ export class Orchestrator {
     this.executionRateLimit = null;
     await this.clearStaleOrchestratorMessages();
 
-    // Reset any orphaned tasks from a previous run/crash before spawning
+    // V2: Reset any orphaned tasks from a previous run/crash before spawning
+    // Use retry tracker for proper retry handling if available
     const activeBeforeStart = this.workers.getActiveWorkers();
-    const orphansReset = await this.state.resetOrphanedTasks(activeBeforeStart);
+    const initialRetryTracker = this.workers.getRetryTracker();
+    const { resetCount: orphansReset, exhaustedCount: orphansExhausted } =
+      await this.state.resetOrphanedTasks(activeBeforeStart, initialRetryTracker ?? undefined);
     if (orphansReset > 0) {
-      this.logger.info(`Reset ${orphansReset} orphaned task(s) from previous run`);
+      this.logger.info(`Reset ${orphansReset} orphaned task(s) from previous run for retry`);
+    }
+    if (orphansExhausted > 0) {
+      this.logger.warn(`${orphansExhausted} orphaned task(s) exceeded retry limit and were marked failed`);
     }
     await this.syncTrackedActiveSessions();
 
@@ -1007,6 +1163,8 @@ export class Orchestrator {
         const sessionId = `worker-${Date.now()}-${i}`;
         await this.workers.spawnWorker(sessionId);
         await this.state.addActiveSession(sessionId);
+        // V2: Record worker spawn event
+        recordWorkerSpawn(this.eventLog, sessionId);
       }
 
       // Spawn security sentinel (runs in parallel with workers)
@@ -1046,6 +1204,9 @@ export class Orchestrator {
         // Check usage
         if (this.usageCritical) {
           this.logger.warn("Usage critical. Signaling workers to wind down...");
+          // V2: Record usage warning event (five_hour field is 0.0-1.0 utilization)
+          const utilization = usageMonitor.getUsage().five_hour ?? 0.95;
+          recordUsageWarning(this.eventLog, utilization);
           await this.workers.signalWindDown("usage_limit", this.usageCriticalResetsAt);
           await this.workers.waitForAllWorkers(WIND_DOWN_GRACE_PERIOD_MS);
           break;
@@ -1053,6 +1214,9 @@ export class Orchestrator {
 
         if (usageMonitor.isWindDownNeeded()) {
           this.logger.warn("Usage threshold reached. Signaling wind-down...");
+          // V2: Record usage warning event (five_hour field is 0.0-1.0 utilization)
+          const utilization = usageMonitor.getUsage().five_hour ?? 0.8;
+          recordUsageWarning(this.eventLog, utilization);
           const resetTime = usageMonitor.getResetTime();
           await this.workers.signalWindDown("usage_limit", resetTime ?? undefined);
           await this.workers.waitForAllWorkers(WIND_DOWN_GRACE_PERIOD_MS);
@@ -1068,16 +1232,67 @@ export class Orchestrator {
           break;
         }
 
+        // V2: Check worker health (timeout and heartbeat)
+        const retryTracker = this.workers.getRetryTracker();
+        const { timedOut, stale } = this.workers.checkWorkerHealth();
+
+        // Handle timed-out workers
+        for (const sessionId of timedOut) {
+          this.logger.warn(`Worker ${sessionId} timed out after wall-clock timeout`);
+
+          // V2: Record worker timeout event (workers exceeded the timeout threshold)
+          recordWorkerTimeout(this.eventLog, sessionId, DEFAULT_WORKER_TIMEOUT_MS);
+
+          // Check for partial commits
+          const hasPartialWork = await this.checkForPartialCommits(sessionId);
+          if (hasPartialWork) {
+            this.logger.warn(`Worker ${sessionId} has partial commits - preserving but adding warning`);
+          }
+
+          // Record failure with context
+          const currentTask = await this.getWorkerCurrentTask(sessionId);
+          if (currentTask && retryTracker) {
+            const errorMsg = hasPartialWork
+              ? "Worker timed out. WARNING: Partial commits exist and may be inconsistent."
+              : "Worker timed out before completing task.";
+            retryTracker.recordFailure(currentTask.id, errorMsg);
+          }
+        }
+
+        // Handle stale workers (no heartbeat)
+        for (const sessionId of stale) {
+          this.logger.warn(`Worker ${sessionId} has no heartbeat - considering stalled`);
+          // V2: Record worker failure event for stale workers
+          recordWorkerFail(this.eventLog, sessionId, "Worker stalled (no heartbeat activity)");
+          const currentTask = await this.getWorkerCurrentTask(sessionId);
+          if (currentTask && retryTracker) {
+            retryTracker.recordFailure(currentTask.id, "Worker stalled (no activity)");
+          }
+        }
+
         // Check for orphaned tasks: in_progress tasks whose owner worker is dead
         const activeWorkers = this.workers.getActiveWorkers();
         await this.syncTrackedActiveSessions(activeWorkers);
-        const orphaned = await this.state.resetOrphanedTasks(activeWorkers);
-        if (orphaned > 0) {
-          this.logger.info(`Reset ${orphaned} orphaned task(s) from dead worker(s)`);
+
+        // V2: Filter out timed-out and stale workers from healthy list
+        const deadWorkers = [...timedOut, ...stale];
+        const healthyWorkers = activeWorkers.filter((id) => !deadWorkers.includes(id));
+
+        // V2: Pass retry tracker for proper retry handling
+        const { resetCount, exhaustedCount } = await this.state.resetOrphanedTasks(
+          healthyWorkers,
+          retryTracker ?? undefined,
+        );
+
+        if (resetCount > 0) {
+          this.logger.info(`Reset ${resetCount} task(s) for retry`);
+        }
+        if (exhaustedCount > 0) {
+          this.logger.warn(`${exhaustedCount} task(s) exceeded retry limit and were marked failed`);
         }
 
         // Re-read tasks after orphan reset to get accurate pending count
-        const refreshedTasks = orphaned > 0 ? await this.state.getAllTasks() : allTasks;
+        const refreshedTasks = resetCount > 0 || exhaustedCount > 0 ? await this.state.getAllTasks() : allTasks;
         const pendingNow = refreshedTasks.filter((t) => t.status === "pending");
 
         if (activeWorkers.length === 0 && pendingNow.length > 0) {
@@ -1090,6 +1305,8 @@ export class Orchestrator {
             const sessionId = `worker-${Date.now()}-respawn-${i}`;
             await this.workers.spawnWorker(sessionId);
             await this.state.addActiveSession(sessionId);
+            // V2: Record worker spawn event
+            recordWorkerSpawn(this.eventLog, sessionId);
           }
           await this.syncTrackedActiveSessions();
         } else if (activeWorkers.length === 0 && pendingNow.length === 0) {
@@ -1115,6 +1332,9 @@ export class Orchestrator {
       // Update usage snapshot in state
       await this.persistProviderUsage(this.options.workerRuntime, usageMonitor.getUsage());
       await this.syncTrackedActiveSessions();
+
+      // V2: Record execution phase completion
+      recordPhaseEnd(this.eventLog, "executing", executeStartTime);
     }
   }
 
@@ -1123,6 +1343,9 @@ export class Orchestrator {
   // ================================================================
 
   private async review(): Promise<boolean> {
+    const reviewStartTime = Date.now();
+    recordPhaseStart(this.eventLog, "reviewing");
+
     await this.state.setStatus("reviewing");
     await this.state.setProgress("Reviewing: checking code changes...");
     await logProgress(this.options.project, "reviewing", "Starting Codex code review");
@@ -1131,6 +1354,7 @@ export class Orchestrator {
     if (this.options.skipCodex) {
       this.logger.info("Codex review skipped (--skip-codex).");
       this.lastCodeReviewRounds = 0;
+      recordPhaseEnd(this.eventLog, "reviewing", reviewStartTime);
       return true;
     }
 
@@ -1165,8 +1389,8 @@ export class Orchestrator {
     const diffPath = path.join(reviewsDir, `diff-${timestamp}.patch`);
     const changedFilesPath = path.join(reviewsDir, `changed-files-${timestamp}.txt`);
 
-    await fs.writeFile(diffPath, diff, "utf-8");
-    await fs.writeFile(changedFilesPath, changedFiles.join("\n"), "utf-8");
+    await fs.writeFile(diffPath, diff, { encoding: "utf-8", mode: 0o600 });
+    await fs.writeFile(changedFilesPath, changedFiles.join("\n"), { encoding: "utf-8", mode: 0o600 });
 
     // Get the current plan path
     const state = this.state.get();
@@ -1291,7 +1515,7 @@ export class Orchestrator {
         responseText = "All code review feedback has been addressed. Please re-review the changed files directly for the latest state.";
       }
 
-      await fs.writeFile(responsePath, responseText, "utf-8");
+      await fs.writeFile(responsePath, responseText, { encoding: "utf-8", mode: 0o600 });
 
       // Re-review
       const canReReviewCode = await this.ensureProviderCapacity(
@@ -1331,6 +1555,10 @@ export class Orchestrator {
       );
     }
 
+    // V2: Record review phase completion and verdict
+    recordPhaseEnd(this.eventLog, "reviewing", reviewStartTime);
+    recordReviewVerdict(this.eventLog, reviewResult.verdict);
+
     return approved;
   }
 
@@ -1350,8 +1578,12 @@ export class Orchestrator {
    * - Edge cases in actor type transitions (e.g., role changes mid-session)
    */
   private async flowReview(cycle: number): Promise<FlowTracingReport | null> {
+    const flowStartTime = Date.now();
+    recordPhaseStart(this.eventLog, "flow_tracing");
+
     if (this.options.skipFlowReview) {
       this.logger.info("Flow-tracing review skipped (--skip-flow-review).");
+      recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
       return null;
     }
 
@@ -1370,17 +1602,20 @@ export class Orchestrator {
       this.logger.warn(
         `Could not get git diff for flow-tracing: ${err instanceof Error ? err.message : String(err)}`,
       );
+      recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
       return null;
     }
 
     if (!diff || diff.trim().length === 0) {
       this.logger.info("No code changes to flow-trace.");
+      recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
       return null;
     }
 
     try {
       const canTraceFlows = await this.ensureProviderCapacity("claude", "flow tracing");
       if (!canTraceFlows) {
+        recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
         return null;
       }
       const report = await this.flowTracer.trace(changedFiles, diff, cycle);
@@ -1397,11 +1632,13 @@ export class Orchestrator {
         this.logger.info("Flow-tracing: no issues found.");
       }
 
+      recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
       return report;
     } catch (err) {
       this.logger.error(
         `Flow-tracing failed: ${err instanceof Error ? err.message : String(err)}`,
       );
+      recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
       return null;
     }
   }
@@ -1411,73 +1648,202 @@ export class Orchestrator {
   // ================================================================
 
   private async checkpoint(): Promise<"continue" | "complete" | "escalate" | "pause"> {
-    await this.state.setStatus("checkpointing");
-    await this.state.setProgress("Checkpoint: evaluating results");
-    await logProgress(this.options.project, "checkpointing", "Evaluating cycle results");
-    this.logger.info("Checkpoint phase...");
-
-    const state = this.state.get();
-
-    // Count completed vs remaining tasks
-    const allTasks = await this.state.getAllTasks();
-    const completed = allTasks.filter((t) => t.status === "completed");
-
-    // Git checkpoint
     try {
-      const cycleNum = state.current_cycle + 1;
-      const completedSubjects = completed.map((t) => t.subject);
-      const checkpointMsg =
-        completedSubjects.length > 0
-          ? `feat: ${completedSubjects.slice(0, 3).join(", ")}${completedSubjects.length > 3 ? ` (+${completedSubjects.length - 3} more)` : ""}`
-          : `feat: cycle ${cycleNum} progress`;
-      await this.git.commit(checkpointMsg);
-      this.logger.info(`Git checkpoint: cycle-${cycleNum}`);
-    } catch (err) {
-      this.logger.warn(
-        `Git checkpoint failed: ${err instanceof Error ? err.message : String(err)}`,
+      await this.state.setStatus("checkpointing");
+      await this.state.setProgress("Checkpoint: evaluating results");
+      await logProgress(this.options.project, "checkpointing", "Evaluating cycle results");
+      this.logger.info("Checkpoint phase...");
+
+      const state = this.state.get();
+
+      // Count completed vs remaining tasks
+      const allTasks = await this.state.getAllTasks();
+      const completed = allTasks.filter((t) => t.status === "completed");
+
+      // Git checkpoint
+      try {
+        const cycleNum = state.current_cycle + 1;
+        const completedSubjects = completed.map((t) => t.subject);
+        const checkpointMsg =
+          completedSubjects.length > 0
+            ? `feat: ${completedSubjects.slice(0, 3).join(", ")}${completedSubjects.length > 3 ? ` (+${completedSubjects.length - 3} more)` : ""}`
+            : `feat: cycle ${cycleNum} progress`;
+        await this.git.commit(checkpointMsg);
+        this.logger.info(`Git checkpoint: cycle-${cycleNum}`);
+      } catch (err) {
+        // Log at error level but continue - checkpoint failures shouldn't crash orchestrator
+        this.logger.error(
+          `Git checkpoint failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      const failed = allTasks.filter((t) => t.status === "failed");
+      const pending = allTasks.filter((t) => t.status === "pending");
+      const inProgress = allTasks.filter((t) => t.status === "in_progress");
+      const remaining = pending.length + inProgress.length;
+
+      this.logger.info(
+        `Checkpoint summary: ${completed.length} completed, ${failed.length} failed, ` +
+        `${remaining} remaining (${pending.length} pending, ${inProgress.length} in progress)`,
       );
-    }
-    const failed = allTasks.filter((t) => t.status === "failed");
-    const pending = allTasks.filter((t) => t.status === "pending");
-    const inProgress = allTasks.filter((t) => t.status === "in_progress");
-    const remaining = pending.length + inProgress.length;
 
-    this.logger.info(
-      `Checkpoint summary: ${completed.length} completed, ${failed.length} failed, ` +
-      `${remaining} remaining (${pending.length} pending, ${inProgress.length} in progress)`,
-    );
+      // All tasks done
+      if (remaining === 0 && failed.length === 0) {
+        return "complete";
+      }
 
-    // All tasks done
-    if (remaining === 0 && failed.length === 0) {
+      // User-requested pause
+      if (this.userPauseRequested) {
+        return "pause";
+      }
+
+      // Usage wind-down needed
+      if (this.getExecutionUsageMonitor().isWindDownNeeded() || this.usageCritical) {
+        return "pause";
+      }
+
+      // Cycle limit reached
+      if (state.current_cycle + 1 >= state.max_cycles) {
+        return "escalate";
+      }
+
+      // Failed tasks but room for more cycles
+      if (failed.length > 0 || remaining > 0) {
+        return "continue";
+      }
+
       return "complete";
-    }
+    } catch (err) {
+      // Checkpoint failure should not crash the orchestrator - escalate to user
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Checkpoint phase failed: ${errorMessage}`);
 
-    // User-requested pause
-    if (this.userPauseRequested) {
-      return "pause";
-    }
+      // Try to save state before escalating
+      try {
+        await this.state.setStatus("escalated");
+        await this.state.setProgress(`Checkpoint failed: ${errorMessage}`);
+      } catch {
+        // If state save also fails, just log it
+        this.logger.error("Failed to save state during checkpoint error handling");
+      }
 
-    // Usage wind-down needed
-    if (this.getExecutionUsageMonitor().isWindDownNeeded() || this.usageCritical) {
-      return "pause";
-    }
-
-    // Cycle limit reached
-    if (state.current_cycle + 1 >= state.max_cycles) {
+      // Escalate to user for manual intervention
       return "escalate";
     }
+  }
 
-    // Failed tasks but room for more cycles
-    if (failed.length > 0 || remaining > 0) {
-      return "continue";
+  // ================================================================
+  // Blast Radius Analysis
+  // ================================================================
+
+  private async computeBlastRadius(completedTasks: Task[]): Promise<BlastRadius> {
+    const allFiles = new Set<string>();
+    for (const task of completedTasks) {
+      for (const f of task.files_changed) {
+        allFiles.add(f);
+      }
     }
 
-    return "complete";
+    // Detect critical files that were touched
+    const criticalPatterns = [
+      /package\.json$/,
+      /package-lock\.json$/,
+      /tsconfig\.json$/,
+      /\.env/,
+      /docker-compose/i,
+      /Dockerfile/i,
+      /\.github\/workflows\//,
+      /migrations?\//,
+      /schema\.(ts|js|sql|prisma)$/,
+    ];
+    const criticalFiles: string[] = [];
+    for (const f of allFiles) {
+      if (criticalPatterns.some((p) => p.test(f))) {
+        criticalFiles.push(f);
+      }
+    }
+
+    // Get line stats from git diff
+    let linesAdded = 0;
+    let linesRemoved = 0;
+    try {
+      const diffStat = await this.git.diffStatFromBase();
+      linesAdded = diffStat.additions;
+      linesRemoved = diffStat.deletions;
+    } catch {
+      // Git diff may fail if no base commit
+    }
+
+    const warnings: string[] = [];
+    if (allFiles.size > 50) {
+      warnings.push(`High file count: ${allFiles.size} files changed (threshold: 50)`);
+    }
+    if (linesAdded + linesRemoved > 2000) {
+      warnings.push(`Large diff: +${linesAdded}/-${linesRemoved} lines (threshold: 2000)`);
+    }
+    if (criticalFiles.length > 0) {
+      warnings.push(`Critical files modified: ${criticalFiles.join(", ")}`);
+    }
+
+    if (warnings.length > 0) {
+      this.logger.warn("Blast radius warnings:");
+      for (const w of warnings) {
+        this.logger.warn(`  - ${w}`);
+      }
+    }
+
+    return {
+      files_changed: allFiles.size,
+      lines_added: linesAdded,
+      lines_removed: linesRemoved,
+      critical_files_touched: criticalFiles,
+      warnings,
+    };
   }
 
   // ================================================================
   // Phase 5: Completion
   // ================================================================
+
+  /**
+   * Graceful shutdown handler for SIGINT/SIGTERM (#19).
+   * Sets state to paused, signals workers to wind down, waits up to 10s,
+   * saves state, and flushes event log.
+   */
+  async shutdown(): Promise<void> {
+    try {
+      await this.state.setStatus("paused");
+    } catch {
+      // Best effort
+    }
+
+    try {
+      if (this.workers) {
+        await this.workers.signalWindDown("user_requested");
+
+        // Wait up to GRACEFUL_SHUTDOWN_TIMEOUT_MS for workers to finish
+        const deadline = Date.now() + GRACEFUL_SHUTDOWN_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+          const active = this.workers.getActiveWorkers();
+          if (active.length === 0) break;
+          await sleep(500);
+        }
+      }
+    } catch {
+      // Best effort
+    }
+
+    try {
+      await this.state.save();
+    } catch {
+      // Best effort
+    }
+
+    try {
+      await this.eventLog.stop();
+    } catch {
+      // Best effort
+    }
+  }
 
   private async complete(): Promise<void> {
     const allTasksFinal = await this.state.getAllTasks();
@@ -1696,7 +2062,7 @@ export class Orchestrator {
         await fs.writeFile(
           escalationPath,
           JSON.stringify(escalation, null, 2) + "\n",
-          "utf-8",
+          { encoding: "utf-8", mode: 0o600 },
         );
         process.exit(2);
       }
@@ -1766,7 +2132,7 @@ export class Orchestrator {
       await fs.writeFile(
         escalationPath,
         JSON.stringify(escalation, null, 2) + "\n",
-        "utf-8",
+        { encoding: "utf-8", mode: 0o600 },
       );
 
       this.logger.info(`Escalation written to ${escalationPath} — exiting for external handler`);
@@ -1884,6 +2250,32 @@ export class Orchestrator {
   }
 
   /**
+   * V2: Check if a worker has made partial commits during its session.
+   * Used to warn about potentially inconsistent state when a worker times out.
+   */
+  private async checkForPartialCommits(sessionId: string): Promise<boolean> {
+    try {
+      const recentCommits = await this.git.getRecentCommits(10);
+      // Look for commits that contain the session ID or task markers
+      return recentCommits.some(
+        (message) => message.includes(sessionId) || message.includes("[task-"),
+      );
+    } catch {
+      // If git fails, assume no partial work to be safe
+      return false;
+    }
+  }
+
+  /**
+   * V2: Get the current task being worked on by a specific worker.
+   * Returns null if the worker has no in-progress task.
+   */
+  private async getWorkerCurrentTask(sessionId: string): Promise<Task | null> {
+    const inProgressTasks = await this.state.getTasksByStatus("in_progress");
+    return inProgressTasks.find((t) => t.owner === sessionId) ?? null;
+  }
+
+  /**
    * Drains all pending worker events and returns the first rate-limit event.
    *
    * Note: `getWorkerEvents()` clears the pending events queue, so non-rate-limit
@@ -1967,7 +2359,7 @@ export class Orchestrator {
           "",
           finding.description,
           "",
-          `**File:** ${finding.file_path}${finding.line_number ? `:${finding.line_number}` : ""}`,
+          `**File:** ${finding.file_path}${finding.line_number !== null && finding.line_number !== undefined ? `:${finding.line_number}` : ""}`,
           `**Flow:** ${finding.flow_id}`,
           `**Actor:** ${finding.actor}`,
           finding.edge_case ? `**Edge Case:** ${finding.edge_case}` : "",
@@ -2008,7 +2400,7 @@ export class Orchestrator {
     if (flowReport && flowReport.findings.length > 0) {
       const findingLines = flowReport.findings.map(
         (f) =>
-          `- [${f.severity.toUpperCase()}] ${f.title}: ${f.description} (${f.file_path}${f.line_number ? `:${f.line_number}` : ""})`,
+          `- [${f.severity.toUpperCase()}] ${f.title}: ${f.description} (${f.file_path}${f.line_number !== null && f.line_number !== undefined ? `:${f.line_number}` : ""})`,
       );
       sections.push(
         "## Flow-Tracing Findings\n\n" + findingLines.join("\n"),
