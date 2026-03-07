@@ -375,10 +375,12 @@ export class Orchestrator {
         }
 
         // Phase 3: Code review and flow tracing in parallel (both are read-only)
+        // Use separate start timestamps for accurate per-phase duration tracking
         const reviewStart = Date.now();
+        const flowStart = Date.now();
         const [approved, flowReport] = await Promise.all([
           this.review().then((r) => { phaseDurations.code_review_ms = Date.now() - reviewStart; return r; }),
-          this.flowReview(cycleNum).then((r) => { phaseDurations.flow_tracing_ms = Date.now() - reviewStart; return r; }),
+          this.flowReview(cycleNum).then((r) => { phaseDurations.flow_tracing_ms = Date.now() - flowStart; return r; }),
         ]);
 
 
