@@ -124,6 +124,7 @@ import * as sdk from "@anthropic-ai/claude-agent-sdk";
 import { Orchestrator } from "./orchestrator.js";
 import { StateManager } from "./state-manager.js";
 import type { CLIOptions, Task } from "../utils/types.js";
+import { DEFAULT_MODEL_CONFIG } from "../utils/types.js";
 import {
   createMockTaskDefinition,
   createTempProjectDir,
@@ -160,6 +161,7 @@ function createTestOptions(projectDir: string, overrides: Partial<CLIOptions> = 
     currentBranch: true, // Use current branch mode (no git operations)
     workerRuntime: "claude",
     forceResume: false,
+    modelConfig: DEFAULT_MODEL_CONFIG,
     ...overrides,
   };
 }

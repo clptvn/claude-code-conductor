@@ -121,6 +121,18 @@ export const OrchestratorStatusSchema = z.enum([
 export const WorkerRuntimeSchema = z.enum(["claude", "codex"]);
 
 // ============================================================
+// Model Config Schema
+// ============================================================
+
+export const ClaudeModelTierSchema = z.enum(["opus", "sonnet", "haiku"]);
+
+export const ModelConfigSchema = z.object({
+  worker: ClaudeModelTierSchema,
+  subagent: ClaudeModelTierSchema,
+  extendedContext: z.boolean(),
+});
+
+// ============================================================
 // Orchestrator State Schema (MAIN SCHEMA)
 // ============================================================
 
@@ -130,6 +142,7 @@ export const OrchestratorStateSchema = z.object({
   project_path: z.string().min(1),
   branch: z.string().min(1),
   worker_runtime: WorkerRuntimeSchema,
+  model_config: ModelConfigSchema.optional(),
   base_commit_sha: z.string().nullable(),
   current_cycle: z.number().int().nonnegative(),
   max_cycles: z.number().int().positive(),

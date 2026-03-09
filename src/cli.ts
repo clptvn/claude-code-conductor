@@ -8,7 +8,8 @@ import { lock, unlock, check } from "proper-lockfile";
 
 import { Orchestrator } from "./core/orchestrator.js";
 import { EventLog } from "./core/event-log.js";
-import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime } from "./utils/types.js";
+import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime, ClaudeModelTier, ModelConfig } from "./utils/types.js";
+import { DEFAULT_MODEL_CONFIG, MODEL_TIER_TO_ID } from "./utils/types.js";
 import {
   getStatePath,
   getLogsDir,
@@ -114,6 +115,82 @@ function parseWorkerRuntime(value: string): WorkerRuntime {
   throw new InvalidArgumentError(
     `Invalid worker runtime "${value}". Expected "claude" or "codex".`,
   );
+}
+
+function parseModelTier(value: string): ClaudeModelTier {
+  if (value === "opus" || value === "sonnet" || value === "haiku") {
+    return value;
+  }
+  throw new InvalidArgumentError(
+    `Invalid model tier "${value}". Expected "opus", "sonnet", or "haiku".`,
+  );
+}
+
+/**
+ * Interactive model selection prompt.
+ * Only runs when no CLI model flags are provided and no context file is given
+ * (i.e., interactive mode).
+ */
+async function promptModelSelection(): Promise<ModelConfig> {
+  const readline = await import("node:readline/promises");
+  const { stdin: input, stdout: output } = await import("node:process");
+  const rl = readline.createInterface({ input, output });
+
+  try {
+    console.log("");
+    console.log(chalk.bold.cyan("  MODEL CONFIGURATION"));
+    console.log(chalk.bold.cyan("  " + "-".repeat(40)));
+    console.log("");
+    console.log(chalk.white("  Available models:"));
+    console.log(chalk.white("    1) opus   - Claude Opus 4.6   (most capable, highest cost)"));
+    console.log(chalk.white("    2) sonnet - Claude Sonnet 4.6 (balanced capability/cost)"));
+    console.log(chalk.white("    3) haiku  - Claude Haiku 4.5  (fastest, lowest cost)"));
+    console.log("");
+
+    // Worker model
+    const workerAnswer = await rl.question(
+      chalk.yellow("  Worker model [opus/sonnet/haiku] (default: opus): "),
+    );
+    const workerModel: ClaudeModelTier = (["opus", "sonnet", "haiku"] as const).includes(
+      workerAnswer.trim().toLowerCase() as ClaudeModelTier,
+    )
+      ? (workerAnswer.trim().toLowerCase() as ClaudeModelTier)
+      : "opus";
+
+    // Subagent model
+    const subagentAnswer = await rl.question(
+      chalk.yellow(`  Subagent model [opus/sonnet/haiku] (default: ${workerModel === "opus" ? "sonnet" : workerModel}): `),
+    );
+    const subagentDefault: ClaudeModelTier = workerModel === "opus" ? "sonnet" : workerModel;
+    const subagentModel: ClaudeModelTier = (["opus", "sonnet", "haiku"] as const).includes(
+      subagentAnswer.trim().toLowerCase() as ClaudeModelTier,
+    )
+      ? (subagentAnswer.trim().toLowerCase() as ClaudeModelTier)
+      : subagentDefault;
+
+    // Extended context (only for opus/sonnet)
+    let extendedContext = false;
+    if (workerModel !== "haiku") {
+      const extAnswer = await rl.question(
+        chalk.yellow("  Use extended 1M token context window? (costs extra) [y/N]: "),
+      );
+      extendedContext = extAnswer.trim().toLowerCase() === "y" || extAnswer.trim().toLowerCase() === "yes";
+    }
+
+    const config: ModelConfig = { worker: workerModel, subagent: subagentModel, extendedContext };
+
+    console.log("");
+    console.log(chalk.green(`  Workers:   ${config.worker} (${MODEL_TIER_TO_ID[config.worker]})`));
+    console.log(chalk.green(`  Subagents: ${config.subagent} (${MODEL_TIER_TO_ID[config.subagent]})`));
+    if (config.extendedContext) {
+      console.log(chalk.green("  Context:   Extended (1M tokens)"));
+    }
+    console.log("");
+
+    return config;
+  } finally {
+    rl.close();
+  }
 }
 
 // ============================================================
@@ -269,7 +346,7 @@ const program = new Command();
 program
   .name("conduct")
   .description("Claude Code Conductor -- hierarchical multi-agent orchestration for large features")
-  .version("0.2.1");
+  .version("0.3.0");
 
 // ============================================================
 // start command
@@ -289,6 +366,9 @@ program
   .option("--current-branch", "Work on the current branch instead of creating conduct/<slug>", false)
   .option("--context-file <path>", "Path to pre-gathered context file (skips interactive Q&A)")
   .option("--worker-runtime <runtime>", "Worker execution backend: claude or codex", parseWorkerRuntime, "claude")
+  .option("--worker-model <tier>", "Claude model for workers: opus, sonnet, or haiku", parseModelTier)
+  .option("--subagent-model <tier>", "Claude model for subagents: opus, sonnet, or haiku", parseModelTier)
+  .option("--extended-context", "Use extended 1M token context window (opus/sonnet only, costs extra)", false)
   .option("-v, --verbose", "Verbose output", false)
   .action(async (feature: string, opts: Record<string, string | boolean | undefined>) => {
     const projectDir = path.resolve(opts.project as string);
@@ -307,6 +387,32 @@ program
       throw new InvalidArgumentError(err instanceof Error ? err.message : String(err));
     }
 
+    // Resolve model configuration: CLI flags > interactive prompt > defaults
+    let modelConfig: ModelConfig;
+    const hasModelFlags = opts.workerModel || opts.subagentModel || opts.extendedContext;
+
+    if (hasModelFlags) {
+      // Use CLI flags (fill in defaults for unspecified values)
+      modelConfig = {
+        worker: (opts.workerModel as ClaudeModelTier) ?? DEFAULT_MODEL_CONFIG.worker,
+        subagent: (opts.subagentModel as ClaudeModelTier) ?? DEFAULT_MODEL_CONFIG.subagent,
+        extendedContext: Boolean(opts.extendedContext),
+      };
+    } else if (!opts.contextFile) {
+      // Interactive mode: prompt user
+      modelConfig = await promptModelSelection();
+    } else {
+      // Non-interactive mode with context file: use defaults
+      modelConfig = { ...DEFAULT_MODEL_CONFIG };
+    }
+
+    // Validate: extended context only works with opus/sonnet, not haiku
+    if (modelConfig.extendedContext && modelConfig.worker === "haiku") {
+      throw new InvalidArgumentError(
+        "Extended context (1M tokens) is not supported with haiku. Use opus or sonnet for the worker model.",
+      );
+    }
+
     const options: CLIOptions = {
       project: projectDir,
       feature,
@@ -322,6 +428,7 @@ program
       currentBranch: Boolean(opts.currentBranch),
       workerRuntime: opts.workerRuntime as WorkerRuntime,
       forceResume: false,
+      modelConfig,
     };
 
     // Acquire process lock to prevent concurrent invocations (#10)
@@ -430,6 +537,13 @@ program
     console.log(chalk.white(`  Feature:      ${state.feature}`));
     console.log(chalk.white(`  Branch:       ${state.branch}`));
     console.log(chalk.white(`  Runtime:      ${state.worker_runtime}`));
+    if (state.model_config) {
+      console.log(chalk.white(`  Worker Model: ${state.model_config.worker}`));
+      console.log(chalk.white(`  Agent Model:  ${state.model_config.subagent}`));
+      if (state.model_config.extendedContext) {
+        console.log(chalk.white(`  Context:      Extended (1M tokens)`));
+      }
+    }
     console.log(chalk.white(`  Cycle:        ${state.current_cycle} / ${state.max_cycles}`));
     console.log(chalk.white(`  Concurrency:  ${state.concurrency}`));
     console.log(chalk.white(`  Started:      ${state.started_at}`));
@@ -611,6 +725,9 @@ program
   .option("--skip-codex", "Skip Codex reviews", false)
   .option("--skip-flow-review", "Skip flow-tracing review phase", false)
   .option("--worker-runtime <runtime>", "Worker execution backend: claude or codex", parseWorkerRuntime)
+  .option("--worker-model <tier>", "Claude model for workers: opus, sonnet, or haiku", parseModelTier)
+  .option("--subagent-model <tier>", "Claude model for subagents: opus, sonnet, or haiku", parseModelTier)
+  .option("--extended-context", "Use extended 1M token context window (opus/sonnet only, costs extra)", false)
   .option("--force-resume", "Force resume even if state is stale (for example stuck in executing)", false)
   .option("-v, --verbose", "Verbose output", false)
   .action(async (opts: Record<string, string | boolean | undefined>) => {
@@ -670,6 +787,17 @@ program
       console.log(chalk.cyan(`\nResuming conductor for: ${state.feature}\n`));
     }
 
+    // Resolve model config: CLI flags override > saved state > defaults
+    const hasModelFlags = opts.workerModel || opts.subagentModel || opts.extendedContext;
+    const savedModelConfig = state.model_config ?? DEFAULT_MODEL_CONFIG;
+    const resumeModelConfig: ModelConfig = hasModelFlags
+      ? {
+          worker: (opts.workerModel as ClaudeModelTier) ?? savedModelConfig.worker,
+          subagent: (opts.subagentModel as ClaudeModelTier) ?? savedModelConfig.subagent,
+          extendedContext: opts.extendedContext ? Boolean(opts.extendedContext) : savedModelConfig.extendedContext,
+        }
+      : savedModelConfig;
+
     const options: CLIOptions = {
       project: projectDir,
       feature: state.feature,
@@ -689,6 +817,7 @@ program
         ? opts.workerRuntime as WorkerRuntime
         : state.worker_runtime,
       forceResume,
+      modelConfig: resumeModelConfig,
     };
 
     // Acquire process lock to prevent concurrent invocations (#10)

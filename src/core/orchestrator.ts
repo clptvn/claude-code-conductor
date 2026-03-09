@@ -26,7 +26,9 @@ import type {
   UsageSnapshot,
   WorkerRuntime,
   ProjectProfile,
+  ModelConfig,
 } from "../utils/types.js";
+import { MODEL_TIER_TO_ID } from "../utils/types.js";
 
 import {
   BRANCH_PREFIX,
@@ -172,7 +174,12 @@ export class Orchestrator {
     const mcpServerPath = path.join(__dirname, "..", "mcp", "coordination-server.js");
 
     this.codex = new CodexReviewer(options.project, orchestratorDir, mcpServerPath, this.logger);
-    this.planner = new Planner(options.project, this.logger);
+    this.planner = new Planner(
+      options.project,
+      this.logger,
+      MODEL_TIER_TO_ID[options.modelConfig.worker],
+      options.modelConfig.extendedContext,
+    );
 
     this.claudeUsage = new UsageMonitor({
       threshold: options.usageThreshold,
@@ -220,9 +227,15 @@ export class Orchestrator {
           orchestratorDir,
           mcpServerPath,
           this.logger,
+          options.modelConfig,
         );
 
-    this.flowTracer = new FlowTracer(options.project, this.logger);
+    this.flowTracer = new FlowTracer(
+      options.project,
+      this.logger,
+      MODEL_TIER_TO_ID[options.modelConfig.worker],
+      options.modelConfig.extendedContext,
+    );
 
     // V2: Initialize event logging
     this.eventLog = new EventLog(options.project);
@@ -324,7 +337,8 @@ export class Orchestrator {
         if (!canExtractConventions) {
           return;
         }
-        this.conventions = await extractConventions(this.options.project);
+        const workerModelId = MODEL_TIER_TO_ID[this.options.modelConfig.worker];
+        this.conventions = await extractConventions(this.options.project, workerModelId, this.options.modelConfig.extendedContext);
         this.projectRules = await loadWorkerRules(this.options.project);
         phaseDurations.conventions_ms = Date.now() - conventionsStart;
 
@@ -624,6 +638,7 @@ export class Orchestrator {
         maxCycles: this.options.maxCycles,
         concurrency: this.options.concurrency,
         workerRuntime: this.options.workerRuntime,
+        modelConfig: this.options.modelConfig,
         baseCommitSha: sha,
       });
 
@@ -658,6 +673,7 @@ export class Orchestrator {
         maxCycles: this.options.maxCycles,
         concurrency: this.options.concurrency,
         workerRuntime: this.options.workerRuntime,
+        modelConfig: this.options.modelConfig,
       });
     }
 
@@ -2510,6 +2526,12 @@ export class Orchestrator {
     console.log(chalk.white(`  Project:      ${this.options.project}`));
     console.log(chalk.white(`  Concurrency:  ${this.options.concurrency} worker(s)`));
     console.log(chalk.white(`  Runtime:      ${this.options.workerRuntime}`));
+    const mc = this.options.modelConfig;
+    console.log(chalk.white(`  Worker Model: ${mc.worker} (${MODEL_TIER_TO_ID[mc.worker]})`));
+    console.log(chalk.white(`  Agent Model:  ${mc.subagent} (${MODEL_TIER_TO_ID[mc.subagent]})`));
+    if (mc.extendedContext) {
+      console.log(chalk.white(`  Context:      Extended (1M tokens)`));
+    }
     console.log(chalk.white(`  Max Cycles:   ${this.options.maxCycles}`));
     console.log(chalk.white(`  Usage Limit:  ${(this.options.usageThreshold * 100).toFixed(0)}%`));
     console.log(chalk.white(`  Skip Codex:   ${this.options.skipCodex ? "Yes" : "No"}`));

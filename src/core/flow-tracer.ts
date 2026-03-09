@@ -41,6 +41,8 @@ export class FlowTracer {
   constructor(
     private projectDir: string,
     private logger: Logger,
+    private model?: string,
+    private extendedContext?: boolean,
   ) {}
 
   // ----------------------------------------------------------------
@@ -221,7 +223,7 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
 
     const resultText = await queryWithTimeout(
       prompt,
-      { allowedTools: ["Read", "Glob", "Grep"], cwd: this.projectDir, maxTurns: 15 },
+      { allowedTools: ["Read", "Glob", "Grep"], cwd: this.projectDir, maxTurns: 15, model: this.model, extendedContext: this.extendedContext },
       5 * 60 * 1000, // 5 min
       "flow-extraction",
     );
@@ -299,7 +301,7 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
 
     const resultText = await queryWithTimeout(
       prompt,
-      { allowedTools: FLOW_TRACING_READ_ONLY_TOOLS, cwd: this.projectDir, maxTurns: FLOW_TRACING_WORKER_MAX_TURNS },
+      { allowedTools: FLOW_TRACING_READ_ONLY_TOOLS, cwd: this.projectDir, maxTurns: FLOW_TRACING_WORKER_MAX_TURNS, model: this.model, extendedContext: this.extendedContext },
       10 * 60 * 1000, // 10 min
       `flow-tracing-${flow.id}`,
     );

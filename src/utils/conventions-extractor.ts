@@ -59,7 +59,7 @@ If you find no examples for a category, use an empty array. Be specific and cite
  * Results are cached to .conductor/conventions.json.
  * If cached and less than 1 hour old, returns cached version.
  */
-export async function extractConventions(projectDir: string): Promise<ProjectConventions> {
+export async function extractConventions(projectDir: string, model?: string, extendedContext?: boolean): Promise<ProjectConventions> {
   const conventionsPath = getConventionsPath(projectDir);
 
   // Check cache (< 1 hour old)
@@ -82,7 +82,7 @@ export async function extractConventions(projectDir: string): Promise<ProjectCon
   try {
     resultText = await queryWithTimeout(
       EXTRACTION_PROMPT,
-      { allowedTools: ["Read", "Glob", "Grep", "Bash"], cwd: projectDir, maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS },
+      { allowedTools: ["Read", "Glob", "Grep", "Bash"], cwd: projectDir, maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS, model, extendedContext },
       5 * 60 * 1000, // 5 min
       "conventions-extraction",
     );

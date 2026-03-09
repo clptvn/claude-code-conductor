@@ -9,7 +9,9 @@ import type {
   Message,
   SessionStatus,
   WorkerSharedContext,
+  ModelConfig,
 } from "../utils/types.js";
+import { MODEL_TIER_TO_ID, DEFAULT_MODEL_CONFIG } from "../utils/types.js";
 import {
   TaskRetryTracker,
   WorkerTimeoutTracker,
@@ -66,6 +68,7 @@ export class WorkerManager implements ExecutionWorkerManager {
     private orchestratorDir: string,
     private mcpServerPath: string,
     private logger: Logger,
+    private modelConfig: ModelConfig = DEFAULT_MODEL_CONFIG,
   ) {
     // Initialize resilience trackers
     this.timeoutTracker = new WorkerTimeoutTracker();
@@ -380,6 +383,7 @@ export class WorkerManager implements ExecutionWorkerManager {
     const workerPrompt = this.buildWorkerPrompt(sessionId);
 
     try {
+      const workerModelId = MODEL_TIER_TO_ID[this.modelConfig.worker];
       const asyncIterable = query({
         prompt: workerPrompt,
         options: {
@@ -396,6 +400,8 @@ export class WorkerManager implements ExecutionWorkerManager {
           },
           cwd: this.projectDir,
           maxTurns: DEFAULT_WORKER_MAX_TURNS,
+          model: workerModelId,
+          ...(this.modelConfig.extendedContext && this.modelConfig.worker !== "haiku" ? { betas: ["context-1m-2025-08-07" as const] } : {}),
           settingSources: ["project"],
         },
       });
@@ -478,6 +484,8 @@ export class WorkerManager implements ExecutionWorkerManager {
     prompt: string,
   ): Promise<void> {
     try {
+      // Sentinel uses subagent model tier (read-only, lighter workload)
+      const sentinelModelId = MODEL_TIER_TO_ID[this.modelConfig.subagent];
       const asyncIterable = query({
         prompt,
         options: {
@@ -499,6 +507,8 @@ export class WorkerManager implements ExecutionWorkerManager {
           },
           cwd: this.projectDir,
           maxTurns: SENTINEL_WORKER_MAX_TURNS,
+          model: sentinelModelId,
+          ...(this.modelConfig.extendedContext && this.modelConfig.subagent !== "haiku" ? { betas: ["context-1m-2025-08-07" as const] } : {}),
         },
       });
 
@@ -687,6 +697,7 @@ export class WorkerManager implements ExecutionWorkerManager {
     return getWorkerPrompt({
       sessionId,
       runtime: "claude",
+      subagentModel: this.modelConfig.subagent,
       ...this.workerContext,
     });
   }

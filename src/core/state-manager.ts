@@ -12,6 +12,7 @@ import {
   type UsageSnapshot,
   type CodexUsageMetrics,
   type TaskRetryTrackerInterface,
+  type ModelConfig,
 } from "../utils/types.js";
 import { validateStateJsonLenient } from "../utils/state-schema.js";
 
@@ -49,6 +50,7 @@ export class StateManager {
       maxCycles: number;
       concurrency: number;
       workerRuntime: "claude" | "codex";
+      modelConfig?: ModelConfig;
       baseCommitSha?: string;
     },
   ): Promise<OrchestratorState> {
@@ -60,6 +62,7 @@ export class StateManager {
       project_path: this.projectDir,
       branch,
       worker_runtime: options.workerRuntime,
+      model_config: options.modelConfig,
       base_commit_sha: options.baseCommitSha ?? null,
       current_cycle: 0,
       max_cycles: options.maxCycles,

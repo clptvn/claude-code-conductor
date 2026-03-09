@@ -8,6 +8,7 @@ export interface OrchestratorState {
   project_path: string;
   branch: string;
   worker_runtime: WorkerRuntime;
+  model_config?: ModelConfig;
   base_commit_sha: string | null;
   current_cycle: number;
   max_cycles: number;
@@ -259,6 +260,46 @@ export interface ThreatModel {
 }
 
 // ============================================================
+// Model Configuration Types
+// ============================================================
+
+/**
+ * Supported Claude model tiers.
+ * These map to model IDs:
+ *   - opus:   claude-opus-4-6
+ *   - sonnet: claude-sonnet-4-6
+ *   - haiku:  claude-haiku-4-5-20251001
+ */
+export type ClaudeModelTier = "opus" | "sonnet" | "haiku";
+
+/**
+ * Model configuration for the conductor.
+ * Controls which Claude model is used at each layer of the system.
+ */
+export interface ModelConfig {
+  /** Model used for execution workers and internal agents (planner, conventions, flow tracing) */
+  worker: ClaudeModelTier;
+  /** Model used for subagents spawned by workers (via the Agent/Task tool) */
+  subagent: ClaudeModelTier;
+  /** Whether to use the extended 1M token context window (costs extra, only opus & sonnet) */
+  extendedContext: boolean;
+}
+
+/** Map from model tier to full model ID */
+export const MODEL_TIER_TO_ID: Record<ClaudeModelTier, string> = {
+  opus: "claude-opus-4-6",
+  sonnet: "claude-sonnet-4-6",
+  haiku: "claude-haiku-4-5-20251001",
+};
+
+/** Default model config: opus for workers, sonnet for subagents, no extended context */
+export const DEFAULT_MODEL_CONFIG: ModelConfig = {
+  worker: "opus",
+  subagent: "sonnet",
+  extendedContext: false,
+};
+
+// ============================================================
 // CLI Types
 // ============================================================
 
@@ -277,6 +318,7 @@ export interface CLIOptions {
   currentBranch: boolean;
   workerRuntime: WorkerRuntime;
   forceResume: boolean;
+  modelConfig: ModelConfig;
 }
 
 // ============================================================

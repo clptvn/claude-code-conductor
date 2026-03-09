@@ -7,7 +7,7 @@
  * project rules, feature context, threat model, and task-type guidance.
  */
 
-import type { ProjectConventions, TaskType, WorkerRuntime } from "./utils/types.js";
+import type { ProjectConventions, TaskType, WorkerRuntime, ClaudeModelTier } from "./utils/types.js";
 import { getPersona, formatPersonaPrompt } from "./worker-personas.js";
 
 export interface WorkerPromptContext {
@@ -20,6 +20,7 @@ export interface WorkerPromptContext {
   threatModelSummary?: string;
   taskType?: TaskType;
   projectGuidance?: string; // V2: Auto-detected project guidance
+  subagentModel?: ClaudeModelTier; // Model tier for subagents spawned by this worker
 }
 
 export function getWorkerPrompt(context: WorkerPromptContext): string {
@@ -29,10 +30,13 @@ export function getWorkerPrompt(context: WorkerPromptContext): string {
     runtime === "codex"
       ? "Use the available Codex CLI tools to inspect files, edit code, run shell commands, and call MCP tools."
       : "Use your full tool suite — Read, Write, Edit, Bash, Glob, Grep — to implement what the task describes.";
+  const subagentModelNote = context.subagentModel
+    ? ` When spawning subagents, use model: "${context.subagentModel}" to control costs.`
+    : "";
   const internalTeamGuidance =
     runtime === "claude"
       ? [
-          "- **Use agent teams for complex tasks.** If a task is large enough to benefit from parallelism (e.g., multiple independent files to create), you can spawn an agent team. You are a full Claude Code session with this capability. Your internal team works on your claimed task only.",
+          `- **Use agent teams for complex tasks.** If a task is large enough to benefit from parallelism (e.g., multiple independent files to create), you can spawn an agent team. You are a full Claude Code session with this capability. Your internal team works on your claimed task only.${subagentModelNote}`,
         ]
       : [];
   const windDownExtraSteps =

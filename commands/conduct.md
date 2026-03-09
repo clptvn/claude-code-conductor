@@ -48,12 +48,18 @@ Use the AskUserQuestion tool to confirm configuration. Use a **two-step flow**:
 - "Which settings do you want to change?" with options:
   - **Concurrency** (default: 2 parallel workers)
   - **Worker runtime** (default: Claude workers; switch to Codex CLI workers)
+  - **Model selection** (default: opus for workers, sonnet for subagents)
   - **Max cycles** (default: 5 cycles before escalating)
   - **Skip Codex** (default: No -- Codex reviews plans and code each cycle)
   - **Skip flow-review** (default: No -- set to yes to skip flow-tracing security review phase)
   - **Current branch** (default: No -- set to yes to work on current branch instead of creating conduct/<slug>)
   - **Dry run** (default: No -- set to yes to only generate the plan without executing)
 - Then ask specific follow-up questions for each selected setting.
+
+**If "Model selection" is chosen**, ask:
+- **Worker model**: "Which model for workers (planner, execution, flow tracing)?" Options: opus (most capable, highest cost), sonnet (balanced), haiku (fastest, cheapest). Default: opus.
+- **Subagent model**: "Which model for subagents spawned by workers?" Options: same as worker, opus, sonnet, haiku. Default: sonnet.
+- **Extended context**: "Use extended 1M token context window? (costs extra, only for opus/sonnet)" Options: Yes, No. Default: No.
 
 ## Phase 2: Write Context File & Launch
 
@@ -86,6 +92,9 @@ A2: <answer>
 
 Concurrency: <n>
 Worker Runtime: <claude|codex>
+Worker Model: <opus|sonnet|haiku>
+Subagent Model: <opus|sonnet|haiku>
+Extended Context: <yes/no>
 Max Cycles: <n>
 Usage Threshold: <n>%
 Skip Codex: <yes/no>
@@ -108,6 +117,9 @@ conduct start "<feature description>" \
   --project "$(pwd)" \
   --context-file "$(pwd)/.conductor/context.md" \
   [--worker-runtime <claude|codex>] \
+  [--worker-model <opus|sonnet|haiku>] \
+  [--subagent-model <opus|sonnet|haiku>] \
+  [--extended-context] \
   --concurrency <n> \
   --max-cycles <n> \
   --usage-threshold <threshold> \
