@@ -1,0 +1,251 @@
+import { countPromptTokens } from "./token-counter.js";
+import {
+  REPLAN_TOKEN_THRESHOLD,
+  COMPACTION_AGENT_MAX_TURNS,
+  COMPACTION_AGENT_TIMEOUT_MS,
+  CHARS_PER_TOKEN_ESTIMATE,
+  getTasksDir,
+  getKnownIssuesPath,
+} from "./constants.js";
+import { queryWithTimeout } from "./sdk-timeout.js";
+import type { Logger } from "./logger.js";
+
+/**
+ * Progressively compact a replan prompt if it exceeds the token threshold.
+ *
+ * Applies tiers of compaction sequentially, re-checking token count after each:
+ *   Tier 1: Truncate flow findings and known issues to severity counts + file pointer
+ *   Tier 2: Drop completed task subjects
+ *   Tier 3: Drop unresolved known issues entirely
+ *   Tier 4: Spawn a compaction agent to intelligently compress the prompt
+ *
+ * Returns the prompt unchanged if it's within the threshold.
+ */
+export async function compactReplanPrompt(
+  prompt: string,
+  projectDir: string,
+  model: string,
+  logger: Logger,
+): Promise<string> {
+  const tokens = await countPromptTokens(prompt, model);
+
+  if (tokens <= REPLAN_TOKEN_THRESHOLD) {
+    return prompt;
+  }
+
+  logger.info(
+    `Replan prompt is ${tokens} tokens (threshold: ${REPLAN_TOKEN_THRESHOLD}). Starting progressive compaction...`,
+  );
+
+  let compacted = prompt;
+
+  // Tier 1: Truncate findings sections to counts + file pointer
+  compacted = applyTier1(compacted, projectDir);
+  const tier1Tokens = await countPromptTokens(compacted, model);
+  logger.info(`Tier 1 (truncate findings): ${tier1Tokens} tokens`);
+  if (tier1Tokens <= REPLAN_TOKEN_THRESHOLD) return compacted;
+
+  // Tier 2: Drop completed task subjects
+  compacted = applyTier2(compacted, projectDir);
+  const tier2Tokens = await countPromptTokens(compacted, model);
+  logger.info(`Tier 2 (drop completed subjects): ${tier2Tokens} tokens`);
+  if (tier2Tokens <= REPLAN_TOKEN_THRESHOLD) return compacted;
+
+  // Tier 3: Drop unresolved known issues entirely
+  compacted = applyTier3(compacted, projectDir);
+  const tier3Tokens = await countPromptTokens(compacted, model);
+  logger.info(`Tier 3 (drop known issues): ${tier3Tokens} tokens`);
+  if (tier3Tokens <= REPLAN_TOKEN_THRESHOLD) return compacted;
+
+  // Tier 4: Spawn a compaction agent
+  logger.info(`Tier 4: spawning compaction agent...`);
+  const tier4Result = await applyTier4(compacted, projectDir, model, logger);
+  if (tier4Result) {
+    const tier4Tokens = await countPromptTokens(tier4Result, model);
+    logger.info(`Tier 4 (compaction agent): ${tier4Tokens} tokens`);
+    if (tier4Tokens <= REPLAN_TOKEN_THRESHOLD) {
+      return tier4Result;
+    }
+    // Tier 4 result still too large — fall through to hard truncation
+    compacted = tier4Result;
+  }
+
+  // Tier 5: Deterministic hard truncation as a guaranteed last resort.
+  // Estimate the max character length from the token threshold and truncate.
+  const maxChars = REPLAN_TOKEN_THRESHOLD * CHARS_PER_TOKEN_ESTIMATE;
+  if (compacted.length > maxChars) {
+    logger.warn(
+      `Prompt still over threshold after all tiers. Hard-truncating from ${compacted.length} to ${maxChars} chars.`,
+    );
+    compacted = compacted.substring(0, maxChars) +
+      "\n\n[TRUNCATED — prompt exceeded token limit. See .conductor/ for full context.]\n";
+  }
+
+  return compacted;
+}
+
+// ============================================================
+// Section replacement helpers
+// ============================================================
+
+/**
+ * Find a ## section in the prompt and replace its content.
+ * Returns the original prompt if the section isn't found.
+ */
+function replaceSection(prompt: string, sectionHeader: string, replacement: string): string {
+  const headerIndex = prompt.indexOf(sectionHeader);
+  if (headerIndex === -1) return prompt;
+
+  // Find where this section ends (next ## header or end of string)
+  const afterHeader = headerIndex + sectionHeader.length;
+  const nextSectionMatch = prompt.substring(afterHeader).search(/\n## /);
+  const sectionEnd = nextSectionMatch === -1
+    ? prompt.length
+    : afterHeader + nextSectionMatch;
+
+  return prompt.substring(0, headerIndex) + replacement + prompt.substring(sectionEnd);
+}
+
+/**
+ * Count lines that start with "- [" in a section (finding/issue lines).
+ */
+function countFindingLines(prompt: string, sectionHeader: string): number {
+  const headerIndex = prompt.indexOf(sectionHeader);
+  if (headerIndex === -1) return 0;
+
+  const afterHeader = headerIndex + sectionHeader.length;
+  const nextSectionMatch = prompt.substring(afterHeader).search(/\n## /);
+  const sectionContent = nextSectionMatch === -1
+    ? prompt.substring(afterHeader)
+    : prompt.substring(afterHeader, afterHeader + nextSectionMatch);
+
+  return sectionContent.split("\n").filter((l) => l.trimStart().startsWith("- [")).length;
+}
+
+// ============================================================
+// Tier implementations
+// ============================================================
+
+/**
+ * Tier 1: Replace flow findings and known issues with severity counts + file pointer.
+ */
+function applyTier1(prompt: string, projectDir: string): string {
+  let result = prompt;
+
+  // Compact flow-tracing findings
+  const flowHeader = "## Flow-Tracing Findings";
+  const flowCount = countFindingLines(result, flowHeader);
+  if (flowCount > 0) {
+    result = replaceSection(
+      result,
+      flowHeader,
+      `${flowHeader}\n\n${flowCount} findings from flow tracing. Details available in the flow-tracing summary files under .conductor/flow-tracing/.\n`,
+    );
+  }
+
+  // Compact known issues
+  const issuesHeader = "## Unresolved Known Issues";
+  const issueCount = countFindingLines(result, issuesHeader);
+  if (issueCount > 0) {
+    const knownIssuesPath = getKnownIssuesPath(projectDir);
+    result = replaceSection(
+      result,
+      issuesHeader,
+      `${issuesHeader}\n\n${issueCount} unresolved issues from previous cycles. See: ${knownIssuesPath}\n`,
+    );
+  }
+
+  return result;
+}
+
+/**
+ * Tier 2: Replace completed task subjects with a count + pointer.
+ */
+function applyTier2(prompt: string, projectDir: string): string {
+  const completedHeader = "## Completed Tasks";
+  const completedCount = countFindingLines(prompt, completedHeader);
+  const tasksDir = getTasksDir(projectDir);
+
+  if (completedCount > 0) {
+    return replaceSection(
+      prompt,
+      completedHeader,
+      `${completedHeader}\n\n${completedCount} tasks completed in previous cycles. See ${tasksDir}/ for details.\n`,
+    );
+  }
+
+  return prompt;
+}
+
+/**
+ * Tier 3: Drop unresolved known issues section entirely.
+ */
+function applyTier3(prompt: string, projectDir: string): string {
+  const issuesHeader = "## Unresolved Known Issues";
+  const knownIssuesPath = getKnownIssuesPath(projectDir);
+
+  return replaceSection(
+    prompt,
+    issuesHeader,
+    `${issuesHeader}\n\nSee: ${knownIssuesPath} for all unresolved issues.\n`,
+  );
+}
+
+/**
+ * Tier 4: Spawn a compaction agent to intelligently compress the prompt.
+ */
+async function applyTier4(prompt: string, projectDir: string, model: string, logger: Logger): Promise<string | null> {
+  const systemPrompt = [
+    "You are a prompt compaction agent. Your job is to compress the following replan prompt",
+    "to be significantly shorter while preserving all critical information.",
+    "",
+    "PRESERVE VERBATIM:",
+    "- The Feature Description section",
+    "- The Instructions section",
+    "- Failed task details (these are critical for replanning)",
+    "- Critical and high severity findings",
+    "",
+    "AGGRESSIVELY SUMMARIZE:",
+    "- Completed work (just note what was done, not details)",
+    "- Medium and low severity findings (counts only)",
+    "- Verbose plan context",
+    "",
+    "REMOVE:",
+    "- Redundancy and repetition",
+    "- Verbose descriptions of completed work",
+    "- Duplicated context that appears in multiple sections",
+    "",
+    "Output ONLY the compacted prompt text. Do not add any commentary or meta-text.",
+    "",
+    "Here is the prompt to compact:",
+    "",
+    prompt,
+  ].join("\n");
+
+  try {
+    const result = await queryWithTimeout(
+      systemPrompt,
+      {
+        allowedTools: ["Read", "Glob", "Grep"],
+        cwd: projectDir,
+        maxTurns: COMPACTION_AGENT_MAX_TURNS,
+        model,
+        settingSources: ["project"],
+      },
+      COMPACTION_AGENT_TIMEOUT_MS,
+      "prompt-compaction",
+    );
+
+    if (result && result.length > 100) {
+      return result;
+    }
+
+    logger.warn("Compaction agent returned insufficient output");
+    return null;
+  } catch (err) {
+    logger.warn(
+      `Compaction agent failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
