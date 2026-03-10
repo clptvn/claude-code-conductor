@@ -30,6 +30,7 @@ import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
 import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
+import { appendJsonlLocked } from "../utils/secure-fs.js";
 
 // ============================================================
 // Worker Handle
@@ -245,11 +246,7 @@ export class WorkerManager implements ExecutionWorkerManager {
 
     // Write to the orchestrator message file, which all workers will read
     const messagePath = path.join(messagesDir, "orchestrator.jsonl");
-    await fs.appendFile(
-      messagePath,
-      JSON.stringify(message) + "\n",
-      "utf-8",
-    );
+    await appendJsonlLocked(messagePath, message);
 
     this.logger.debug(`Wind-down message written to ${messagePath}`);
   }

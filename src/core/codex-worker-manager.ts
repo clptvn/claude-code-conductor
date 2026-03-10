@@ -19,6 +19,7 @@ import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
 import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
+import { appendJsonlLocked } from "../utils/secure-fs.js";
 
 interface WorkerHandle {
   sessionId: string;
@@ -136,7 +137,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     };
 
     const messagePath = path.join(messagesDir, "orchestrator.jsonl");
-    await fs.appendFile(messagePath, JSON.stringify(message) + "\n", "utf-8");
+    await appendJsonlLocked(messagePath, message);
   }
 
   async waitForAllWorkers(timeoutMs: number): Promise<void> {

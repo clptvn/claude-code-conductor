@@ -15,6 +15,7 @@ import {
   type ModelConfig,
 } from "../utils/types.js";
 import { validateStateJsonLenient } from "../utils/state-schema.js";
+import { validateFileName } from "../utils/validation.js";
 
 import {
   getOrchestratorDir,
@@ -248,6 +249,18 @@ export class StateManager {
     dependencyIds: string[],
   ): Promise<Task> {
     this.ensureState();
+
+    // Validate task ID and dependency IDs to prevent path traversal (#30)
+    const idValidation = validateFileName(id);
+    if (!idValidation.valid) {
+      throw new Error(`Invalid task ID "${id}": ${idValidation.reason}`);
+    }
+    for (const depId of dependencyIds) {
+      const depValidation = validateFileName(depId);
+      if (!depValidation.valid) {
+        throw new Error(`Invalid dependency ID "${depId}": ${depValidation.reason}`);
+      }
+    }
 
     const now = new Date().toISOString();
     const task: Task = {

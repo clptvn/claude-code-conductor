@@ -24,6 +24,7 @@ import {
 } from "../utils/constants.js";
 import { rankClaimableTasks, type RankedTask } from "../core/task-scheduler.js";
 import { validateFileName, validateFileNames } from "../utils/validation.js";
+import { appendJsonlLocked } from "../utils/secure-fs.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -414,6 +415,11 @@ export async function handleClaimTask(
     // Verify all dependencies are completed
     if (task.depends_on.length > 0) {
       for (const depId of task.depends_on) {
+        // Validate dep ID to prevent path traversal (#30)
+        const depValidation = validateFileName(depId);
+        if (!depValidation.valid) {
+          return { success: false, error: `Invalid dependency ID "${depId}": ${depValidation.reason}` };
+        }
         const depPath = path.join(dir, `${depId}.json`);
         const depTask = await readJsonFile<Task>(depPath);
         if (!depTask || depTask.status !== "completed") {
@@ -433,7 +439,7 @@ export async function handleClaimTask(
 
     await fs.writeFile(taskPath, JSON.stringify(task, null, 2), { encoding: "utf-8", mode: 0o600 });
 
-    // Gather dependency context
+    // Gather dependency context (dep IDs already validated above)
     const dependency_context: { task_id: string; result_summary: string | null; files_changed: string[] }[] = [];
     for (const depId of task.depends_on) {
       const depPath = path.join(dir, `${depId}.json`);
@@ -629,11 +635,7 @@ export async function handleCompleteTask(
     };
 
     const msgPath = path.join(msgDir, `${sessionId}.jsonl`);
-    await fs.appendFile(
-      msgPath,
-      JSON.stringify(completionMessage) + "\n",
-      { encoding: "utf-8", mode: 0o600 }
-    );
+    await appendJsonlLocked(msgPath, completionMessage);
 
     return { success: true, task };
   } catch (err: unknown) {
