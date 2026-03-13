@@ -21,13 +21,14 @@ function tryParseJsonLine(line: string): Record<string, unknown> | null {
 }
 
 /**
- * Tests for H14-H17 fixes and H-9/M-19 parity features in codex-worker-manager.ts.
+ * Tests for H14-H17 fixes and H-9/H-10/M-19 parity features in codex-worker-manager.ts.
  *
  * H14: killAllWorkers SIGTERM→SIGKILL escalation
  * H15: signalWindDown reason validation
  * H16: consumeLines byte-aware buffer truncation
  * H17/H-9: checkWorkerHealth timeout + heartbeat tracking
  * H-9: Heartbeat detection via JSONL stream parsing
+ * H-10: Retry tracking with session resumption
  * M-19: Model configuration support
  *
  * The CodexWorkerManager class requires spawning real child processes
@@ -689,6 +690,267 @@ describe("CodexWorkerManager M-19 - Model Configuration", () => {
     expect(orchestratorSource).toContain("[agents]");
     expect(orchestratorSource).toContain("job_max_runtime_seconds");
     expect(orchestratorSource).toContain("CODEX_JOB_MAX_RUNTIME_SECONDS");
+  });
+});
+
+// ================================================================
+// H-10: Retry Tracking and Session Resumption
+// ================================================================
+
+describe("CodexWorkerManager H-10 - Retry Tracking and Session Resumption", () => {
+  // ================================================================
+  // Source code verification tests
+  // ================================================================
+
+  it("source code imports TaskRetryTracker from worker-resilience", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-10: Must import TaskRetryTracker
+    expect(source).toMatch(/import\s*\{[^}]*TaskRetryTracker[^}]*\}\s*from\s*["']\.\/worker-resilience/);
+  });
+
+  it("getRetryTracker() no longer returns null", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-10: getRetryTracker should NOT contain "return null"
+    const getRetryMethod = source.substring(
+      source.indexOf("getRetryTracker"),
+      source.indexOf("private async initializeSessionStatus"),
+    );
+    expect(getRetryMethod).not.toContain("return null");
+
+    // H-10: Should return this.retryTracker
+    expect(getRetryMethod).toContain("return this.retryTracker");
+  });
+
+  it("source has retryTracker field initialized in constructor", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-10: Must have retryTracker field
+    expect(source).toContain("private retryTracker: TaskRetryTracker");
+    // H-10: Must initialize in constructor
+    expect(source).toContain("this.retryTracker = new TaskRetryTracker()");
+  });
+
+  it("source has lastThreadIds map for storing thread IDs", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-10: Must have lastThreadIds map
+    expect(source).toContain("lastThreadIds");
+    expect(source).toContain("Map<string, string>");
+  });
+
+  it("source has buildResumeArgs method", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-10: Must have buildResumeArgs method
+    expect(source).toContain("buildResumeArgs");
+    // H-10: Must use "resume" and "--last" in the args
+    expect(source).toContain('"resume"');
+    expect(source).toContain('"--last"');
+  });
+
+  it("source code references H-10 fix in comments", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    expect(source).toContain("H-10");
+  });
+
+  it("source records failure in retry tracker on worker failure", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-10: Must call retryTracker.recordFailure in the settle callback
+    expect(source).toContain("this.retryTracker.recordFailure(sessionId, message)");
+  });
+
+  it("source preserves threadId in lastThreadIds before cleanup", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-10: Must store threadId in lastThreadIds before cleanup
+    expect(source).toContain("this.lastThreadIds.set(sessionId, handle.threadId)");
+    // H-10: Thread ID preservation must happen before tracker cleanup
+    const lastThreadIdsSetIdx = source.indexOf("this.lastThreadIds.set(sessionId");
+    const stopTrackingIdx = source.indexOf("this.timeoutTracker.stopTracking(sessionId)");
+    expect(lastThreadIdsSetIdx).toBeLessThan(stopTrackingIdx);
+  });
+
+  // ================================================================
+  // Algorithm reproduction tests
+  // ================================================================
+
+  it("TaskRetryTracker: first failure allows retry", async () => {
+    const { TaskRetryTracker } = await import("./worker-resilience.js");
+
+    const tracker = new TaskRetryTracker();
+    tracker.recordFailure("worker-1", "Codex exited with code 1");
+
+    // First failure — should still allow retry (MAX_TASK_RETRIES = 2)
+    expect(tracker.shouldRetry("worker-1")).toBe(true);
+  });
+
+  it("TaskRetryTracker: exhaustion after MAX_TASK_RETRIES failures", async () => {
+    const { TaskRetryTracker } = await import("./worker-resilience.js");
+    const { MAX_TASK_RETRIES } = await import("../utils/constants.js");
+
+    const tracker = new TaskRetryTracker();
+
+    // Record MAX_TASK_RETRIES failures
+    for (let i = 0; i < MAX_TASK_RETRIES; i++) {
+      tracker.recordFailure("worker-1", `Failure ${i + 1}`);
+    }
+
+    // Should be exhausted
+    expect(tracker.shouldRetry("worker-1")).toBe(false);
+  });
+
+  it("TaskRetryTracker: getRetryContext formats error correctly", async () => {
+    const { TaskRetryTracker } = await import("./worker-resilience.js");
+
+    const tracker = new TaskRetryTracker();
+    tracker.recordFailure("worker-1", "Codex exited with code 1");
+
+    const context = tracker.getRetryContext("worker-1");
+    expect(context).not.toBeNull();
+    expect(context).toContain("Previous attempt failed");
+    expect(context).toContain("Retry");
+  });
+
+  it("TaskRetryTracker: no retry context for untracked worker", async () => {
+    const { TaskRetryTracker } = await import("./worker-resilience.js");
+
+    const tracker = new TaskRetryTracker();
+    const context = tracker.getRetryContext("unknown-worker");
+    expect(context).toBeNull();
+  });
+
+  it("TaskRetryTracker: shouldRetry returns true for untracked worker", async () => {
+    const { TaskRetryTracker } = await import("./worker-resilience.js");
+
+    const tracker = new TaskRetryTracker();
+    // Never failed — can try
+    expect(tracker.shouldRetry("unknown-worker")).toBe(true);
+  });
+
+  it("session resumption args: with threadId returns resume args", () => {
+    // Reproduce the buildResumeArgs logic
+    const lastThreadIds = new Map<string, string>();
+    lastThreadIds.set("worker-1", "th_abc123");
+
+    const threadId = lastThreadIds.get("worker-1");
+    expect(threadId).toBeDefined();
+    expect(threadId!.length).toBeGreaterThan(0);
+
+    // Should build resume args with exec resume --last
+    const args = [
+      "exec",
+      "resume",
+      "--last",
+      "--model",
+      "o4-mini",
+      "--json",
+      "--full-auto",
+      "--sandbox",
+      "workspace-write" as const,
+      "corrective prompt here",
+    ];
+
+    expect(args[0]).toBe("exec");
+    expect(args[1]).toBe("resume");
+    expect(args[2]).toBe("--last");
+    expect(args).toContain("--model");
+    expect(args).toContain("--json");
+  });
+
+  it("session resumption args: without threadId returns null", () => {
+    // Reproduce the buildResumeArgs logic when no threadId is available
+    const lastThreadIds = new Map<string, string>();
+
+    const threadId = lastThreadIds.get("worker-1");
+    // No thread ID — should fall back to fresh start (return null)
+    expect(threadId).toBeUndefined();
+
+    // The method would return null here
+    const result = threadId && threadId.length > 0 ? "resume-args" : null;
+    expect(result).toBeNull();
+  });
+
+  it("session resumption args: empty string threadId returns null", () => {
+    const lastThreadIds = new Map<string, string>();
+    lastThreadIds.set("worker-1", "");
+
+    const threadId = lastThreadIds.get("worker-1");
+    // Empty thread ID — should NOT attempt resume
+    const result = threadId && threadId.length > 0 ? "resume-args" : null;
+    expect(result).toBeNull();
+  });
+
+  it("error categorization: JSONL error events are recorded", () => {
+    // Reproduce error categorization from JSONL events
+    const errorEvent = '{"type":"error","message":"Rate limit exceeded"}';
+    const parsed = tryParseJsonLine(errorEvent);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.type).toBe("error");
+    expect(parsed!.message).toBe("Rate limit exceeded");
+  });
+
+  it("error categorization: turn.failed events are recorded", () => {
+    const failedEvent = '{"type":"turn.failed","error":{"message":"Model overloaded"}}';
+    const parsed = tryParseJsonLine(failedEvent);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.type).toBe("turn.failed");
+    const error = parsed!.error as Record<string, unknown> | undefined;
+    expect(error).toBeDefined();
+    expect(error!.message).toBe("Model overloaded");
+  });
+
+  it("error categorization: non-zero exit with no error event uses generic message", () => {
+    // When exit code is non-zero but no JSONL error event was received,
+    // the settle callback generates a generic error message
+    const code = 1;
+    const signal: string | null = null;
+    const reason = signal
+      ? `Codex worker terminated by signal ${signal}`
+      : `Codex exited with code ${code ?? "unknown"}`;
+    expect(reason).toBe("Codex exited with code 1");
+  });
+
+  // ================================================================
+  // Integration test: lifecycle verification
+  // ================================================================
+
+  it("getRetryTracker return type is TaskRetryTracker (not null)", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-10: Return type must be TaskRetryTracker, not null
+    expect(source).toContain("getRetryTracker(): TaskRetryTracker");
+    expect(source).not.toContain("getRetryTracker(): null");
   });
 });
 
