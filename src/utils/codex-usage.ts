@@ -104,9 +104,12 @@ export function pickPreferredCodexUsage(readings: CodexUsageReading[]): CodexUsa
       return reading;
     }
 
-    return new Date(reading.timestamp).getTime() >= new Date(latest.timestamp).getTime()
-      ? reading
-      : latest;
+    // M-32: Guard against NaN timestamps — invalid dates would cause comparison to always be false
+    const readingTs = new Date(reading.timestamp).getTime();
+    const latestTs = new Date(latest.timestamp).getTime();
+    if (Number.isNaN(readingTs)) return latest;
+    if (Number.isNaN(latestTs)) return reading;
+    return readingTs >= latestTs ? reading : latest;
   }, null as CodexUsageReading | null);
 }
 

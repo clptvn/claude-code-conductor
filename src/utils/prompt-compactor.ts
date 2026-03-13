@@ -120,10 +120,14 @@ function replaceSection(prompt: string, sectionHeader: string, replacement: stri
 
 /**
  * Count lines that start with "- [" in a section (finding/issue lines).
+ * M-30: Uses line-anchored regex instead of indexOf to avoid false partial-string matches.
  */
 function countFindingLines(prompt: string, sectionHeader: string): number {
-  const headerIndex = prompt.indexOf(sectionHeader);
-  if (headerIndex === -1) return 0;
+  // Use line-anchored regex (same pattern as replaceSection) to find the section header
+  const headerPattern = new RegExp(`^${escapeRegex(sectionHeader)}`, "m");
+  const match = headerPattern.exec(prompt);
+  if (!match) return 0;
+  const headerIndex = match.index;
 
   const afterHeader = headerIndex + sectionHeader.length;
   const nextSectionMatch = prompt.substring(afterHeader).search(/\n## /);
@@ -259,6 +263,7 @@ async function applyTier4(prompt: string, projectDir: string, model: string, log
       },
       COMPACTION_AGENT_TIMEOUT_MS,
       "prompt-compaction",
+      logger,
     );
 
     if (result && result.length > 100) {

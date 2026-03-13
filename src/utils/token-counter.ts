@@ -8,12 +8,25 @@ const COUNT_TOKENS_TIMEOUT_MS = 10_000;
 /** After this many consecutive failures, disable remote counting for the process. */
 const MAX_CONSECUTIVE_FAILURES = 3;
 
+/** M-29: Time-based circuit breaker recovery (5 minutes). */
+const CIRCUIT_BREAKER_RECOVERY_MS = 5 * 60 * 1000;
+
 let cachedClient: Anthropic | null = null;
 let consecutiveFailures = 0;
 let remoteDisabled = false;
+let disabledAt: number | null = null;
 
 async function getClient(): Promise<Anthropic | null> {
-  if (remoteDisabled) return null;
+  // M-29: Time-based circuit breaker recovery
+  if (remoteDisabled) {
+    if (disabledAt && Date.now() - disabledAt > CIRCUIT_BREAKER_RECOVERY_MS) {
+      remoteDisabled = false;
+      consecutiveFailures = 0;
+      disabledAt = null;
+    } else {
+      return null;
+    }
+  }
   if (cachedClient) return cachedClient;
 
   const token = await readOAuthToken();
@@ -66,6 +79,7 @@ export async function countPromptTokens(text: string, model: string): Promise<nu
     consecutiveFailures++;
     if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
       remoteDisabled = true;
+      disabledAt = Date.now(); // M-29: Record when disabled for recovery
     }
     // Fallback to character-based estimate
     return localEstimate(text);
@@ -79,4 +93,5 @@ export function _resetTokenCounterState(): void {
   cachedClient = null;
   consecutiveFailures = 0;
   remoteDisabled = false;
+  disabledAt = null; // M-29: Reset recovery timestamp
 }
