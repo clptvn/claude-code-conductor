@@ -191,11 +191,22 @@ export class UsageMonitor implements ProviderUsageMonitor {
     this.logger.info("Reset time reached, verifying utilization...");
     let snapshot = await this.poll();
 
-    // Keep waiting in 60s increments if still above the resume threshold
+    // Keep waiting in 60s increments if still above the resume threshold.
+    // Bounded to MAX_WAIT_ITERATIONS to prevent infinite loops (H23).
+    const MAX_WAIT_ITERATIONS = 60; // 60 * 60s = 1 hour max wait
+    let iterations = 0;
     while (snapshot.five_hour >= RESUME_UTILIZATION_THRESHOLD) {
+      if (iterations >= MAX_WAIT_ITERATIONS) {
+        this.logger.error(
+          `waitForReset exceeded max iterations (${MAX_WAIT_ITERATIONS}). ` +
+          `Utilization still at ${(snapshot.five_hour * 100).toFixed(1)}%. Returning to avoid infinite wait.`
+        );
+        break;
+      }
+      iterations++;
       this.logger.warn(
         `Utilization still at ${(snapshot.five_hour * 100).toFixed(1)}% ` +
-        `(need < ${(RESUME_UTILIZATION_THRESHOLD * 100).toFixed(0)}%). Waiting 60s...`
+        `(need < ${(RESUME_UTILIZATION_THRESHOLD * 100).toFixed(0)}%). Waiting 60s... (attempt ${iterations}/${MAX_WAIT_ITERATIONS})`
       );
       await sleep(60_000);
       snapshot = await this.poll();
@@ -215,7 +226,7 @@ export class UsageMonitor implements ProviderUsageMonitor {
    * Tracks consecutive failures and adjusts the adaptive poll interval.
    */
   async poll(): Promise<UsageSnapshot> {
-    const token = this.readOAuthToken();
+    const token = await this.readOAuthToken();
     if (!token) {
       this.logger.warn("No OAuth token found; returning last known usage");
       this.recordPollFailure();
@@ -489,10 +500,10 @@ export class UsageMonitor implements ProviderUsageMonitor {
 
   /**
    * Read the OAuth access token.
-   * Delegates to the shared readOAuthToken() utility.
+   * Delegates to the shared readOAuthToken() utility (async, H22/H24).
    */
-  private readOAuthToken(): string | null {
-    const token = sharedReadOAuthToken();
+  private async readOAuthToken(): Promise<string | null> {
+    const token = await sharedReadOAuthToken();
     if (token) {
       this.logger.debug("OAuth token found");
     } else {

@@ -12,6 +12,28 @@ const execFileAsync = promisify(execFile);
 /** Timeout for each codex review invocation: 5 minutes. */
 const REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
 
+/** Maximum length for user-provided content injected into review prompts (H18). */
+const MAX_PROMPT_CONTENT_LENGTH = 5000;
+
+/**
+ * Sanitize user-provided content before injecting into review prompts.
+ * Prevents prompt injection by stripping role markers and truncating (H18).
+ */
+function sanitizePromptContent(content: string, maxLength: number = MAX_PROMPT_CONTENT_LENGTH): string {
+  if (!content) return "";
+  let sanitized = content;
+  // Strip role markers that could confuse the model
+  sanitized = sanitized.replace(/Human:|Assistant:|User:|System:/gi, "[removed]");
+  // Strip instruction markers
+  sanitized = sanitized.replace(/\[INST\].*?\[\/INST\]/gi, "[removed]");
+  sanitized = sanitized.replace(/<<SYS>>.*?<\/SYS>>/gi, "[removed]");
+  // Truncate to max length
+  if (sanitized.length > maxLength) {
+    sanitized = sanitized.substring(0, maxLength) + "\n[truncated]";
+  }
+  return sanitized;
+}
+
 /** Valid verdict strings for the structured JSON response. */
 const VALID_VERDICTS = new Set<string>([
   "APPROVE",
@@ -149,8 +171,9 @@ export class CodexReviewer {
     diffPath: string,
   ): Promise<CodexReviewResult> {
     return this.withRetryOnInvalidResponse(async () => {
+      const sanitizedDescription = sanitizePromptContent(taskDescription);
       const prompt =
-        `Review the code changes for the following task:\n\n${taskDescription}\n\n` +
+        `Review the code changes for the following task:\n\n${sanitizedDescription}\n\n` +
         "Compare the implementation against the plan and the diff. " +
         "Check for correctness, completeness, style, and potential bugs. " +
         "For each issue, provide a clear description. " +
@@ -437,10 +460,27 @@ export class CodexReviewer {
     const fenceMatch = output.match(/```json\s*\n([\s\S]*?)\n\s*```/);
     let jsonStr = fenceMatch?.[1]?.trim();
 
-    // Fall back to finding a raw JSON object (non-greedy to avoid over-capture)
+    // Fall back to finding a raw JSON object containing "review_performed".
+    // The previous regex /\{[\s\S]*?"review_performed"[\s\S]*?\}/ was broken:
+    // the non-greedy *? after "review_performed" stops at the FIRST },
+    // which may be a nested object's closing brace (H13).
+    // Instead, search backwards from "review_performed" for opening braces
+    // and try JSON.parse progressively until we find valid JSON.
     if (!jsonStr) {
-      const rawMatch = output.match(/\{[\s\S]*?"review_performed"[\s\S]*?\}/);
-      jsonStr = rawMatch?.[0];
+      const idx = output.indexOf('"review_performed"');
+      if (idx !== -1) {
+        let braceStart = output.lastIndexOf("{", idx);
+        while (braceStart >= 0) {
+          try {
+            const candidate = output.substring(braceStart);
+            JSON.parse(candidate);
+            jsonStr = candidate;
+            break;
+          } catch {
+            braceStart = output.lastIndexOf("{", braceStart - 1);
+          }
+        }
+      }
     }
 
     if (!jsonStr) {
