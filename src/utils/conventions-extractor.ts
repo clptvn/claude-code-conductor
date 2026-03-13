@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ProjectConventions } from "./types.js";
 import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS } from "./constants.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
+import type { Logger } from "./logger.js";
 
 const DEFAULT_CONVENTIONS: ProjectConventions = {
   auth_patterns: [],
@@ -59,8 +60,9 @@ If you find no examples for a category, use an empty array. Be specific and cite
  * Results are cached to .conductor/conventions.json.
  * If cached and less than 1 hour old, returns cached version.
  */
-export async function extractConventions(projectDir: string, model?: string, extendedContext?: boolean): Promise<ProjectConventions> {
+export async function extractConventions(projectDir: string, model?: string, extendedContext?: boolean, logger?: Logger): Promise<ProjectConventions> {
   const conventionsPath = getConventionsPath(projectDir);
+  const warn = (msg: string) => logger ? logger.warn(msg) : process.stderr.write(msg + "\n");
 
   // Check cache (< 1 hour old)
   try {
@@ -85,14 +87,15 @@ export async function extractConventions(projectDir: string, model?: string, ext
       { allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"], cwd: projectDir, maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS, model, extendedContext, settingSources: ["project"] },
       5 * 60 * 1000, // 5 min
       "conventions-extraction",
+      logger,
     );
   } catch (error) {
-    console.warn("Conventions extraction agent failed:", error);
+    warn(`Conventions extraction agent failed: ${error instanceof Error ? error.message : String(error)}`);
     return { ...DEFAULT_CONVENTIONS };
   }
 
   // Parse the JSON output from the agent's response
-  const conventions = parseConventionsOutput(resultText);
+  const conventions = parseConventionsOutput(resultText, logger);
 
   // Ensure the directory exists and save cache with secure permissions
   try {
@@ -101,7 +104,7 @@ export async function extractConventions(projectDir: string, model?: string, ext
     // Use mode 0o600 for file (owner rw only)
     await fs.writeFile(conventionsPath, JSON.stringify(conventions, null, 2), { encoding: "utf-8", mode: 0o600 });
   } catch (error) {
-    console.warn("Failed to cache conventions:", error);
+    warn(`Failed to cache conventions: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   return conventions;
@@ -110,9 +113,11 @@ export async function extractConventions(projectDir: string, model?: string, ext
 /**
  * Parse the agent's output to extract the ProjectConventions JSON block.
  */
-function parseConventionsOutput(text: string): ProjectConventions {
+function parseConventionsOutput(text: string, logger?: Logger): ProjectConventions {
+  const warn = (msg: string) => logger ? logger.warn(msg) : process.stderr.write(msg + "\n");
+
   if (!text || text.trim() === "") {
-    console.warn("Conventions extraction returned empty response; using defaults.");
+    warn("Conventions extraction returned empty response; using defaults.");
     return { ...DEFAULT_CONVENTIONS };
   }
 
@@ -137,7 +142,7 @@ function parseConventionsOutput(text: string): ProjectConventions {
 
     // Warn if critical security_invariants field is empty
     if (conventions.security_invariants.length === 0) {
-      console.warn(
+      warn(
         "Conventions extraction found no security_invariants. " +
         "Consider reviewing the codebase manually for security patterns."
       );
@@ -147,7 +152,7 @@ function parseConventionsOutput(text: string): ProjectConventions {
   } catch (error) {
     // Log first 500 chars of raw output to help debug parse failures
     const preview = text.substring(0, 500);
-    console.warn(
+    warn(
       `Failed to parse conventions JSON from agent output; using defaults.\n` +
       `Parse error: ${error instanceof Error ? error.message : String(error)}\n` +
       `Raw output preview (first 500 chars):\n${preview}`

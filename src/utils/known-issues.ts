@@ -5,6 +5,7 @@ import { lock } from "proper-lockfile";
 import { getKnownIssuesPath } from "./constants.js";
 import { writeFileSecure, SECURE_FILE_MODE, SECURE_DIR_MODE } from "./secure-fs.js";
 import type { KnownIssue } from "./types.js";
+import type { Logger } from "./logger.js";
 
 /** Lock configuration — matches appendJsonlLocked in secure-fs.ts */
 const LOCK_CONFIG = {
@@ -16,13 +17,14 @@ const LOCK_CONFIG = {
  * Load known issues from .conductor/known-issues.json.
  * Returns empty array if file doesn't exist or contains corrupt JSON.
  */
-export async function loadKnownIssues(projectDir: string): Promise<KnownIssue[]> {
+export async function loadKnownIssues(projectDir: string, logger?: Logger): Promise<KnownIssue[]> {
   const issuesPath = getKnownIssuesPath(projectDir);
+  const warn = (msg: string) => logger ? logger.warn(msg) : process.stderr.write(msg + "\n");
   try {
     const contents = await fs.readFile(issuesPath, "utf-8");
     const parsed = JSON.parse(contents);
     if (!Array.isArray(parsed)) {
-      console.warn(`[known-issues] Expected array in ${issuesPath}, got ${typeof parsed}`);
+      warn(`[known-issues] Expected array in ${issuesPath}, got ${typeof parsed}`);
       return [];
     }
     return parsed as KnownIssue[];
@@ -31,7 +33,7 @@ export async function loadKnownIssues(projectDir: string): Promise<KnownIssue[]>
       return [];
     }
     // Log SyntaxError and other errors but don't crash
-    console.warn(
+    warn(
       `[known-issues] Error loading ${issuesPath}: ${err instanceof Error ? err.message : String(err)}`,
     );
     return [];
@@ -67,6 +69,7 @@ async function ensureFileForLock(filePath: string): Promise<void> {
 export async function addKnownIssues(
   projectDir: string,
   newIssues: Omit<KnownIssue, "id" | "addressed" | "addressed_in_cycle">[],
+  logger?: Logger,
 ): Promise<KnownIssue[]> {
   const issuesPath = getKnownIssuesPath(projectDir);
 
@@ -78,7 +81,7 @@ export async function addKnownIssues(
     release = await lock(issuesPath, LOCK_CONFIG);
 
     // Read under lock to avoid TOCTOU
-    const existing = await loadKnownIssues(projectDir);
+    const existing = await loadKnownIssues(projectDir, logger);
 
     // Build a set of dedup keys from existing issues
     const dedupKeys = new Set(
@@ -121,6 +124,7 @@ export async function markIssuesAddressed(
   projectDir: string,
   issueIds: string[],
   cycle: number,
+  logger?: Logger,
 ): Promise<void> {
   const issuesPath = getKnownIssuesPath(projectDir);
 
@@ -132,7 +136,7 @@ export async function markIssuesAddressed(
     release = await lock(issuesPath, LOCK_CONFIG);
 
     // Read under lock to avoid TOCTOU
-    const issues = await loadKnownIssues(projectDir);
+    const issues = await loadKnownIssues(projectDir, logger);
     const idSet = new Set(issueIds);
 
     for (const issue of issues) {
@@ -157,8 +161,8 @@ export async function markIssuesAddressed(
 /**
  * Get only unresolved issues.
  */
-export async function getUnresolvedIssues(projectDir: string): Promise<KnownIssue[]> {
-  const issues = await loadKnownIssues(projectDir);
+export async function getUnresolvedIssues(projectDir: string, logger?: Logger): Promise<KnownIssue[]> {
+  const issues = await loadKnownIssues(projectDir, logger);
   return issues.filter((issue) => !issue.addressed);
 }
 

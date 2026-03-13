@@ -70,32 +70,34 @@ describe("loadKnownIssues", () => {
   it("returns empty array for corrupt JSON (SyntaxError)", async () => {
     const issuesPath = path.join(conductorDir, "known-issues.json");
     await fs.writeFile(issuesPath, "{not valid json[[[");
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const result = await loadKnownIssues(tempDir);
     expect(result).toEqual([]);
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy.mock.calls[0]![0]).toContain("Error loading");
-    warnSpy.mockRestore();
+    const stderrCalls = stderrSpy.mock.calls.filter(c => String(c[0]).includes("[known-issues]"));
+    expect(stderrCalls).toHaveLength(1);
+    expect(String(stderrCalls[0]![0])).toContain("Error loading");
+    stderrSpy.mockRestore();
   });
 
   it("returns empty array when JSON is not an array", async () => {
     const issuesPath = path.join(conductorDir, "known-issues.json");
     await fs.writeFile(issuesPath, '{"not": "an array"}');
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const result = await loadKnownIssues(tempDir);
     expect(result).toEqual([]);
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy.mock.calls[0]![0]).toContain("Expected array");
-    warnSpy.mockRestore();
+    const stderrCalls = stderrSpy.mock.calls.filter(c => String(c[0]).includes("[known-issues]"));
+    expect(stderrCalls).toHaveLength(1);
+    expect(String(stderrCalls[0]![0])).toContain("Expected array");
+    stderrSpy.mockRestore();
   });
 
   it("returns empty array for empty file", async () => {
     const issuesPath = path.join(conductorDir, "known-issues.json");
     await fs.writeFile(issuesPath, "");
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const result = await loadKnownIssues(tempDir);
     expect(result).toEqual([]);
-    warnSpy.mockRestore();
+    stderrSpy.mockRestore();
   });
 });
 

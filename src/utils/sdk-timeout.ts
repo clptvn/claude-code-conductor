@@ -1,5 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServerConfig, SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { Logger } from "./logger.js";
 
 /**
  * Options passed to the Agent SDK `query()` call.
@@ -41,6 +42,7 @@ export async function queryWithTimeout(
   options: QueryOptions,
   timeoutMs: number,
   label: string,
+  logger?: Logger,
 ): Promise<string> {
   let resultText = "";
   let timedOut = false;
@@ -78,10 +80,12 @@ export async function queryWithTimeout(
   const timeoutPromise = new Promise<string>((resolve) => {
     timerId = setTimeout(() => {
       timedOut = true;
-      console.warn(
-        `[sdk-timeout] ${label} timed out after ${Math.round(timeoutMs / 1000)}s. ` +
-        `Partial result: ${resultText.length} chars.`,
-      );
+      const msg = `[sdk-timeout] ${label} timed out after ${Math.round(timeoutMs / 1000)}s. Partial result: ${resultText.length} chars.`;
+      if (logger) {
+        logger.warn(msg);
+      } else {
+        process.stderr.write(msg + "\n");
+      }
       resolve(resultText);
     }, timeoutMs);
   });
