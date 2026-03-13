@@ -193,51 +193,57 @@ describe("CodexWorkerManager H16 - consumeLines byte-aware truncation", () => {
 // H17: checkWorkerHealth timeout tracking
 // ================================================================
 
-describe("CodexWorkerManager H17 - checkWorkerHealth timeout tracking", () => {
-  it("source code checks wall-clock timeout for workers", async () => {
+describe("CodexWorkerManager H17/H-9 - checkWorkerHealth timeout and heartbeat tracking", () => {
+  it("source code uses WorkerTimeoutTracker and HeartbeatTracker for health checks", async () => {
     const source = await fs.readFile(
       path.join(__dirname, "codex-worker-manager.ts"),
       "utf-8",
     );
 
-    // H17: Must have a timeout constant (30 minutes)
-    expect(source).toContain("CODEX_WORKER_TIMEOUT_MS");
-    expect(source).toContain("30 * 60 * 1000");
+    // H-9 FIX: Must use WorkerTimeoutTracker (replaces hardcoded 30-minute timeout)
+    expect(source).toContain("WorkerTimeoutTracker");
+    expect(source).toContain("timeoutTracker");
+    expect(source).toContain("getTimedOutWorkers");
 
-    // H17: Must track start time
-    expect(source).toContain("startedAt");
+    // H-9 FIX: Must use HeartbeatTracker for stale detection via JSONL stream
+    expect(source).toContain("HeartbeatTracker");
+    expect(source).toContain("heartbeatTracker");
+    expect(source).toContain("getStaleWorkers");
 
-    // H17: Must return timedOut array with actual data
+    // H-9: Must return timedOut array with actual data
     expect(source).toContain("timedOut");
   });
 
-  it("source code references H17 fix in comment", async () => {
+  it("source code references H-9 fix in comment", async () => {
     const source = await fs.readFile(
       path.join(__dirname, "codex-worker-manager.ts"),
       "utf-8",
     );
-    expect(source).toContain("H17");
+    expect(source).toContain("H-9");
   });
 
-  it("timeout detection logic works correctly", () => {
-    // Reproduce the timeout detection logic
-    const CODEX_WORKER_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-    const now = Date.now();
+  it("timeout detection logic works correctly via WorkerTimeoutTracker", async () => {
+    // Import and use the actual WorkerTimeoutTracker
+    const { WorkerTimeoutTracker } = await import("./worker-resilience.js");
 
-    // Worker started 31 minutes ago — should be timed out
-    const startedAt31MinAgo = new Date(now - 31 * 60 * 1000).toISOString();
-    const elapsed31 = now - new Date(startedAt31MinAgo).getTime();
-    expect(elapsed31).toBeGreaterThan(CODEX_WORKER_TIMEOUT_MS);
+    // Use a short timeout for testing
+    const tracker = new WorkerTimeoutTracker(100); // 100ms timeout
 
-    // Worker started 5 minutes ago — should NOT be timed out
-    const startedAt5MinAgo = new Date(now - 5 * 60 * 1000).toISOString();
-    const elapsed5 = now - new Date(startedAt5MinAgo).getTime();
-    expect(elapsed5).toBeLessThan(CODEX_WORKER_TIMEOUT_MS);
+    tracker.startTracking("worker-1");
 
-    // Worker started exactly at timeout — should NOT be timed out (using >)
-    const startedAtExact = new Date(now - CODEX_WORKER_TIMEOUT_MS).toISOString();
-    const elapsedExact = now - new Date(startedAtExact).getTime();
-    expect(elapsedExact).toBeLessThanOrEqual(CODEX_WORKER_TIMEOUT_MS);
+    // Immediately after start — should NOT be timed out
+    expect(tracker.isTimedOut("worker-1")).toBe(false);
+    expect(tracker.getTimedOutWorkers()).toEqual([]);
+
+    // Wait for timeout to elapse
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // Now should be timed out
+    expect(tracker.isTimedOut("worker-1")).toBe(true);
+    expect(tracker.getTimedOutWorkers()).toContain("worker-1");
+
+    // Cleanup
+    tracker.stopTracking("worker-1");
   });
 
   it("checkWorkerHealth returns correct structure", async () => {
@@ -250,8 +256,9 @@ describe("CodexWorkerManager H17 - checkWorkerHealth timeout tracking", () => {
     expect(source).toContain("timedOut: string[]");
     expect(source).toContain("stale: string[]");
 
-    // Stale detection is not supported for Codex workers
-    expect(source).toContain("stale: []");
+    // H-9: Stale detection is now supported via HeartbeatTracker (no longer returns empty stale: [])
+    expect(source).toContain("heartbeatTracker");
+    expect(source).toContain("recordHeartbeat");
   });
 });
 
