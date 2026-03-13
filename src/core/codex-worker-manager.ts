@@ -17,7 +17,6 @@ import {
   SESSION_STATUS_FILE,
   MAX_BUFFER_SIZE_BYTES,
   CODEX_MODEL_MAP,
-  CODEX_JOB_MAX_RUNTIME_SECONDS,
 } from "../utils/constants.js";
 import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";

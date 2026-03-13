@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -182,7 +182,7 @@ describe("CodexWorkerManager H16 - consumeLines byte-aware truncation", () => {
   });
 
   it("byte-aware truncation handles ASCII correctly", () => {
-    const MAX_SIZE = 50;
+    // MAX_SIZE = 50 bytes for this test
     const asciiStr = "A".repeat(100); // 100 bytes > 50 byte limit
 
     const buf = Buffer.from(asciiStr, "utf-8");
@@ -194,7 +194,7 @@ describe("CodexWorkerManager H16 - consumeLines byte-aware truncation", () => {
   });
 
   it("byte-aware truncation handles mixed content", () => {
-    const MAX_SIZE = 50;
+    // MAX_SIZE = 50 bytes for this test
     const mixed = "Hello 🌍 World 🎉 Test 💻"; // mix of ASCII and multi-byte
 
     const buf = Buffer.from(mixed, "utf-8");

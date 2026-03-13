@@ -26,7 +26,7 @@ import type {
   UsageSnapshot,
   WorkerRuntime,
   ProjectProfile,
-  ModelConfig,
+
 } from "../utils/types.js";
 import { MODEL_TIER_TO_ID, ConductorExitError } from "../utils/types.js";
 
