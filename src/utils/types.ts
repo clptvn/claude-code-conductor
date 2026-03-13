@@ -1,4 +1,24 @@
 // ============================================================
+// Error Types
+// ============================================================
+
+/**
+ * Typed error thrown instead of process.exit() in the orchestrator.
+ * Allows finally blocks to run cleanup (event log flush, state save,
+ * orphaned worker termination) before the CLI layer translates the
+ * error into the appropriate process.exit() call.
+ */
+export class ConductorExitError extends Error {
+  constructor(
+    public readonly exitCode: number,
+    public readonly reason: string,
+  ) {
+    super(`Conductor exit (code ${exitCode}): ${reason}`);
+    this.name = "ConductorExitError";
+  }
+}
+
+// ============================================================
 // Orchestrator State Types
 // ============================================================
 
