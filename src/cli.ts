@@ -9,7 +9,7 @@ import { lock, unlock, check } from "proper-lockfile";
 import { Orchestrator } from "./core/orchestrator.js";
 import { EventLog } from "./core/event-log.js";
 import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime, ClaudeModelTier, ModelConfig } from "./utils/types.js";
-import { DEFAULT_MODEL_CONFIG, MODEL_TIER_TO_ID } from "./utils/types.js";
+import { DEFAULT_MODEL_CONFIG, MODEL_TIER_TO_ID, ConductorExitError } from "./utils/types.js";
 import {
   getStatePath,
   getLogsDir,
@@ -18,6 +18,7 @@ import {
   getPauseSignalPath,
   getCliLockPath,
   CLI_LOCK_STALE_TIMEOUT_MS,
+  DEFAULT_USAGE_THRESHOLD,
 } from "./utils/constants.js";
 import { validateBounds } from "./utils/validation.js";
 import { validateStateJsonLenient } from "./utils/state-schema.js";
@@ -458,6 +459,11 @@ program
         } catch {
           // Best effort
         }
+        // Release lock BEFORE exiting to prevent stale locks (H31 fix)
+        if (releaseLock) {
+          try { await releaseLock(); } catch { /* best effort */ }
+          releaseLock = undefined;
+        }
         process.exit(0);
       };
       process.on('SIGINT', shutdown);
@@ -465,6 +471,11 @@ program
 
       await orchestrator.run();
     } catch (err) {
+      // ConductorExitError: orchestrator requested clean exit (e.g. escalation).
+      // The finally block will release the lock, then we exit with the requested code.
+      if (err instanceof ConductorExitError) {
+        process.exit(err.exitCode);
+      }
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nConductor failed: ${message}\n`));
       process.exit(1);
@@ -805,7 +816,7 @@ program
         ? parseInt(opts.concurrency as string, 10)
         : state.concurrency,
       maxCycles: state.max_cycles,
-      usageThreshold: 0.8,
+      usageThreshold: DEFAULT_USAGE_THRESHOLD,
       skipCodex: Boolean(opts.skipCodex),
       skipFlowReview: Boolean(opts.skipFlowReview),
       dryRun: false,
@@ -847,6 +858,11 @@ program
         } catch {
           // Best effort
         }
+        // Release lock BEFORE exiting to prevent stale locks (H31 fix)
+        if (releaseLock) {
+          try { await releaseLock(); } catch { /* best effort */ }
+          releaseLock = undefined;
+        }
         process.exit(0);
       };
       process.on('SIGINT', shutdown);
@@ -854,6 +870,9 @@ program
 
       await orchestrator.run();
     } catch (err) {
+      if (err instanceof ConductorExitError) {
+        process.exit(err.exitCode);
+      }
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nResume failed: ${message}\n`));
       process.exit(1);
