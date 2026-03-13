@@ -6,12 +6,29 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
- * Tests for H14-H17 fixes in codex-worker-manager.ts.
+ * Reproduce the tryParseJsonLine logic from CodexWorkerManager.
+ * Used in H-9 algorithm reproduction tests.
+ */
+function tryParseJsonLine(line: string): Record<string, unknown> | null {
+  if (!line.trim().startsWith("{")) {
+    return null;
+  }
+  try {
+    return JSON.parse(line) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tests for H14-H17 fixes and H-9/M-19 parity features in codex-worker-manager.ts.
  *
  * H14: killAllWorkers SIGTERM→SIGKILL escalation
  * H15: signalWindDown reason validation
  * H16: consumeLines byte-aware buffer truncation
- * H17: checkWorkerHealth wall-clock timeout tracking
+ * H17/H-9: checkWorkerHealth timeout + heartbeat tracking
+ * H-9: Heartbeat detection via JSONL stream parsing
+ * M-19: Model configuration support
  *
  * The CodexWorkerManager class requires spawning real child processes
  * and MCP infrastructure. We test the fix behaviors through:
@@ -259,6 +276,273 @@ describe("CodexWorkerManager H17/H-9 - checkWorkerHealth timeout and heartbeat t
     // H-9: Stale detection is now supported via HeartbeatTracker (no longer returns empty stale: [])
     expect(source).toContain("heartbeatTracker");
     expect(source).toContain("recordHeartbeat");
+  });
+});
+
+// ================================================================
+// H-9: Heartbeat Detection via JSONL Stream Parsing
+// ================================================================
+
+describe("CodexWorkerManager H-9 - Heartbeat Detection via JSONL", () => {
+  it("source code imports HeartbeatTracker and WorkerTimeoutTracker from worker-resilience", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-9: Must import HeartbeatTracker
+    expect(source).toMatch(/import\s*\{[^}]*HeartbeatTracker[^}]*\}\s*from\s*["']\.\/worker-resilience/);
+    // H-9: Must import WorkerTimeoutTracker
+    expect(source).toMatch(/import\s*\{[^}]*WorkerTimeoutTracker[^}]*\}\s*from\s*["']\.\/worker-resilience/);
+  });
+
+  it("source code calls recordHeartbeat on valid JSONL events", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-9: Must call recordHeartbeat after parsing JSONL
+    expect(source).toContain("this.heartbeatTracker.recordHeartbeat(sessionId)");
+    // H-9: Must update monotonic time on the handle
+    expect(source).toContain("handle.lastEventAt = process.hrtime.bigint()");
+  });
+
+  it("source code captures thread.started events and stores threadId", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-9: Must check for thread.started event type
+    expect(source).toContain('"thread.started"');
+    // H-9: Must store thread_id from parsed event
+    expect(source).toContain("handle.threadId = parsed.thread_id");
+    // H-9: Must validate thread_id is a string before storing
+    expect(source).toContain('typeof parsed.thread_id === "string"');
+  });
+
+  it("source code cleans up trackers when worker finishes", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-9: Must stop timeout tracking on finish
+    expect(source).toContain("this.timeoutTracker.stopTracking(sessionId)");
+    // H-9: Must clean up heartbeat tracking on finish
+    expect(source).toContain("this.heartbeatTracker.cleanup(sessionId)");
+  });
+
+  it("source code starts tracking in spawnWorker and spawnSentinelWorker", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-9: Must start timeout and heartbeat tracking when spawning
+    expect(source).toContain("this.timeoutTracker.startTracking(");
+    // Initial heartbeat recording should happen at spawn time
+    const heartbeatCalls = (source.match(/this\.heartbeatTracker\.recordHeartbeat\(/g) || []).length;
+    // At least 3 calls: 2 in spawn methods + 1 in processCodexOutputLine
+    expect(heartbeatCalls).toBeGreaterThanOrEqual(3);
+  });
+
+  it("checkWorkerHealth uses heartbeat tracker for stale detection (not hardcoded)", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // H-9: checkWorkerHealth must NOT use the old hardcoded timeout pattern
+    expect(source).not.toContain("CODEX_WORKER_TIMEOUT_MS");
+    expect(source).not.toMatch(/30\s*\*\s*60\s*\*\s*1000/); // no hardcoded 30 min
+
+    // H-9: Must use tracker-based approach
+    expect(source).toContain("this.timeoutTracker");
+    expect(source).toContain("this.heartbeatTracker");
+
+    // H-9: Stale workers must exclude timed-out workers
+    expect(source).toContain("!timedOut.includes(id)");
+  });
+
+  it("old stale: [] pattern is removed from checkWorkerHealth", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // The old placeholder return with empty stale array should be gone
+    // It should NOT contain a literal "stale: []" in the checkWorkerHealth method
+    const checkHealthMethod = source.substring(
+      source.indexOf("checkWorkerHealth"),
+      source.indexOf("getRetryTracker"),
+    );
+    expect(checkHealthMethod).not.toContain("stale: []");
+  });
+
+  // ================================================================
+  // Algorithm reproduction tests
+  // ================================================================
+
+  it("valid JSONL line triggers heartbeat recording", () => {
+    // Reproduce the processCodexOutputLine logic:
+    // A valid JSON line starting with "{" should parse and trigger heartbeat
+
+    const validLine = '{"type":"turn.completed","usage":{"total_tokens":100}}';
+    const parsed = tryParseJsonLine(validLine);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.type).toBe("turn.completed");
+    // In the real code, this triggers handle.lastEventAt = process.hrtime.bigint()
+    // and heartbeatTracker.recordHeartbeat(sessionId)
+  });
+
+  it("invalid JSONL line does not crash and returns null", () => {
+    // Invalid JSON should not crash — tryParseJsonLine returns null
+    expect(tryParseJsonLine("not json at all")).toBeNull();
+    expect(tryParseJsonLine("{broken json")).toBeNull();
+    expect(tryParseJsonLine("")).toBeNull();
+    expect(tryParseJsonLine("  ")).toBeNull();
+    // Non-object JSON starting without { should also return null
+    expect(tryParseJsonLine("[1,2,3]")).toBeNull();
+  });
+
+  it("thread.started with thread_id stores threadId", () => {
+    // Reproduce the thread ID capture logic
+    const line = '{"type":"thread.started","thread_id":"th_abc123"}';
+    const parsed = tryParseJsonLine(line);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.type).toBe("thread.started");
+    expect(typeof parsed!.thread_id).toBe("string");
+    expect(parsed!.thread_id).toBe("th_abc123");
+
+    // Simulate the storage logic
+    let threadId: string | null = null;
+    const eventType = typeof parsed!.type === "string" ? parsed!.type : "unknown";
+    if (eventType === "thread.started" && typeof parsed!.thread_id === "string" && (parsed!.thread_id as string).length > 0) {
+      threadId = parsed!.thread_id as string;
+    }
+    expect(threadId).toBe("th_abc123");
+  });
+
+  it("thread.started without thread_id does not store threadId", () => {
+    // If thread_id is missing or not a string, threadId should remain null
+    const line = '{"type":"thread.started"}';
+    const parsed = tryParseJsonLine(line);
+    expect(parsed).not.toBeNull();
+
+    let threadId: string | null = null;
+    const eventType = typeof parsed!.type === "string" ? parsed!.type : "unknown";
+    if (eventType === "thread.started" && typeof parsed!.thread_id === "string" && (parsed!.thread_id as string).length > 0) {
+      threadId = parsed!.thread_id as string;
+    }
+    expect(threadId).toBeNull();
+  });
+
+  it("thread.started with empty string thread_id does not store threadId", () => {
+    const line = '{"type":"thread.started","thread_id":""}';
+    const parsed = tryParseJsonLine(line);
+    expect(parsed).not.toBeNull();
+
+    let threadId: string | null = null;
+    const eventType = typeof parsed!.type === "string" ? parsed!.type : "unknown";
+    if (eventType === "thread.started" && typeof parsed!.thread_id === "string" && (parsed!.thread_id as string).length > 0) {
+      threadId = parsed!.thread_id as string;
+    }
+    expect(threadId).toBeNull();
+  });
+
+  it("HeartbeatTracker detects stale workers after threshold", async () => {
+    const { HeartbeatTracker } = await import("./worker-resilience.js");
+
+    // Use a short threshold for testing (100ms)
+    const tracker = new HeartbeatTracker(100);
+
+    tracker.recordHeartbeat("worker-1");
+
+    // Immediately after heartbeat — should NOT be stale
+    expect(tracker.isStale("worker-1")).toBe(false);
+    expect(tracker.getStaleWorkers()).toEqual([]);
+
+    // Wait for threshold to elapse
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // Now should be stale
+    expect(tracker.isStale("worker-1")).toBe(true);
+    expect(tracker.getStaleWorkers()).toContain("worker-1");
+
+    // Cleanup
+    tracker.cleanup("worker-1");
+    expect(tracker.getStaleWorkers()).toEqual([]);
+  });
+
+  it("HeartbeatTracker resets staleness on new heartbeat", async () => {
+    const { HeartbeatTracker } = await import("./worker-resilience.js");
+
+    const tracker = new HeartbeatTracker(100);
+
+    tracker.recordHeartbeat("worker-1");
+
+    // Wait almost to threshold
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Send another heartbeat — resets the timer
+    tracker.recordHeartbeat("worker-1");
+
+    // Wait 80ms more — total 160ms since start but only 80ms since last heartbeat
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Should NOT be stale because we refreshed the heartbeat
+    expect(tracker.isStale("worker-1")).toBe(false);
+
+    // Cleanup
+    tracker.cleanup("worker-1");
+  });
+
+  it("HeartbeatTracker tracks multiple workers independently", async () => {
+    const { HeartbeatTracker } = await import("./worker-resilience.js");
+
+    const tracker = new HeartbeatTracker(100);
+
+    tracker.recordHeartbeat("worker-1");
+    tracker.recordHeartbeat("worker-2");
+
+    // Wait for threshold
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // Only worker-2 gets a refresh
+    tracker.recordHeartbeat("worker-2");
+
+    // worker-1 should be stale, worker-2 should not
+    expect(tracker.isStale("worker-1")).toBe(true);
+    expect(tracker.isStale("worker-2")).toBe(false);
+
+    const stale = tracker.getStaleWorkers();
+    expect(stale).toContain("worker-1");
+    expect(stale).not.toContain("worker-2");
+
+    tracker.cleanup("worker-1");
+    tracker.cleanup("worker-2");
+  });
+
+  it("untracked worker is not reported as stale", async () => {
+    const { HeartbeatTracker } = await import("./worker-resilience.js");
+
+    const tracker = new HeartbeatTracker(100);
+
+    // Worker never tracked — should not be stale
+    expect(tracker.isStale("unknown-worker")).toBe(false);
+    expect(tracker.getStaleWorkers()).toEqual([]);
+  });
+
+  it("checkWorkerHealth return type matches WorkerHealthStatus interface", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-worker-manager.ts"),
+      "utf-8",
+    );
+
+    // The return type must match { timedOut: string[]; stale: string[] }
+    expect(source).toContain("checkWorkerHealth(): { timedOut: string[]; stale: string[] }");
   });
 });
 
