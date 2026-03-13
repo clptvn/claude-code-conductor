@@ -1449,6 +1449,16 @@ export class Orchestrator {
           }
         }
 
+        // Terminate timed-out and stale workers before resetting their tasks
+        // to prevent zombie workers from continuing to modify files while a
+        // retry worker is spawned for the same task.
+        const deadWorkerIds = [...timedOut, ...stale];
+        for (const sessionId of deadWorkerIds) {
+          if (this.workers.terminateWorker) {
+            await this.workers.terminateWorker(sessionId);
+          }
+        }
+
         // Check for orphaned tasks: in_progress tasks whose owner worker is dead
         const activeWorkers = this.workers.getActiveWorkers();
         await this.syncTrackedActiveSessions(activeWorkers);
@@ -1480,9 +1490,20 @@ export class Orchestrator {
           this.logger.info(
             `All workers done but ${pendingNow.length} task(s) remain. Respawning ${respawnCount} worker(s)...`,
           );
+          // Identify retry-eligible tasks (tasks that were reset from a previous failure)
+          const retryTasks = pendingNow.filter((t) => (t.retry_count ?? 0) > 0);
           for (let i = 0; i < respawnCount; i++) {
             const sessionId = `worker-${Date.now()}-respawn-${i}`;
-            await this.workers.spawnWorker(sessionId);
+            const retryTask = retryTasks[i]; // May be undefined if fewer retries than workers
+            // Use spawnWorkerForRetry for retry-eligible tasks when the manager supports it
+            if (retryTask && this.workers.spawnWorkerForRetry) {
+              const correctivePrompt = retryTask.last_error
+                ? `Previous attempt failed: ${retryTask.last_error}. Please fix this and complete the task.`
+                : undefined;
+              await this.workers.spawnWorkerForRetry(sessionId, retryTask.id, correctivePrompt);
+            } else {
+              await this.workers.spawnWorker(sessionId);
+            }
             await this.state.addActiveSession(sessionId);
             // V2: Record worker spawn event
             recordWorkerSpawn(this.eventLog, sessionId);

@@ -802,8 +802,14 @@ describe("CodexWorkerManager H-10 - Retry Tracking and Session Resumption", () =
     // the thread ID and resume the Codex session.
     expect(source).toContain("this.taskThreadIds.set(failedTaskId, handle.threadId)");
     // H-10: Thread ID preservation must happen before tracker cleanup
+    // Scope the search to after the taskThreadIds.set call (which is inside the
+    // runCodexSession settle block) to find the corresponding stopTracking call
+    // in the same function, not in terminateWorker or other methods.
     const taskThreadIdsSetIdx = source.indexOf("this.taskThreadIds.set(failedTaskId");
-    const stopTrackingIdx = source.indexOf("this.timeoutTracker.stopTracking(sessionId)");
+    const stopTrackingIdx = source.indexOf(
+      "this.timeoutTracker.stopTracking(sessionId)",
+      taskThreadIdsSetIdx,
+    );
     expect(taskThreadIdsSetIdx).toBeLessThan(stopTrackingIdx);
   });
 

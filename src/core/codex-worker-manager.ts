@@ -271,10 +271,56 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     // Force-remove any remaining workers from tracking
     for (const sessionId of [...this.activeWorkers.keys()]) {
       await this.updateSessionStatus(sessionId, "done", "Force killed by orchestrator");
+      this.sessionToTaskMap.delete(sessionId);
       this.activeWorkers.delete(sessionId);
     }
 
     this.logger.info("All Codex workers have been killed and removed from tracking.");
+  }
+
+  /**
+   * Terminate a specific worker by session ID.
+   * Sends SIGTERM, waits up to 5s, then SIGKILL if still running.
+   * Cleans up all tracking state for the worker.
+   */
+  async terminateWorker(sessionId: string): Promise<void> {
+    const handle = this.activeWorkers.get(sessionId);
+    if (!handle) {
+      return;
+    }
+
+    this.logger.warn(`Terminating worker ${sessionId}`);
+
+    // Send SIGTERM
+    if (handle.child && !handle.child.killed) {
+      handle.child.kill("SIGTERM");
+    }
+
+    // Wait up to 5s for graceful exit
+    const TERM_TIMEOUT_MS = 5_000;
+    const timeout = new Promise<"timeout">((resolve) =>
+      setTimeout(() => resolve("timeout"), TERM_TIMEOUT_MS),
+    );
+
+    if (handle.promise) {
+      const result = await Promise.race([
+        handle.promise.then(() => "done" as const).catch(() => "done" as const),
+        timeout,
+      ]);
+
+      if (result === "timeout" && handle.child && !handle.child.killed) {
+        this.logger.warn(`Worker ${sessionId} did not exit after SIGTERM; sending SIGKILL`);
+        handle.child.kill("SIGKILL");
+      }
+    }
+
+    // Clean up tracking state
+    this.timeoutTracker.stopTracking(sessionId);
+    this.heartbeatTracker.cleanup(sessionId);
+    this.sessionToTaskMap.delete(sessionId);
+    handle.child = null;
+    this.activeWorkers.delete(sessionId);
+    await this.updateSessionStatus(sessionId, "done", "Terminated by orchestrator (timed out/stale)");
   }
 
   getWorkerEvents(): OrchestratorEvent[] {
@@ -417,13 +463,16 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     this.timeoutTracker.startTracking(sessionId);
     this.heartbeatTracker.recordHeartbeat(sessionId);
 
-    // Use resume if we have a preserved thread ID, otherwise fresh start
-    if (hasResumeCapability && correctivePrompt) {
+    // Use resume if we have a preserved thread ID, otherwise fresh start.
+    // A default corrective prompt is used when none is provided, so resume
+    // is not skipped just because the caller omitted a prompt.
+    if (hasResumeCapability) {
+      const resumePrompt = correctivePrompt ?? "Continue working on this task. The previous attempt did not complete successfully.";
       handle.promise = this.runCodexSessionWithResume(
         sessionId,
         handle,
         taskId,
-        correctivePrompt,
+        resumePrompt,
         "workspace-write",
         "Codex worker running (resumed session)...",
       );
@@ -533,6 +582,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
           // H-9 FIX: Clean up resilience trackers to prevent memory leaks
           this.timeoutTracker.stopTracking(sessionId);
           this.heartbeatTracker.cleanup(sessionId);
+          this.sessionToTaskMap.delete(sessionId);
 
           handle.child = null;
           this.activeWorkers.delete(sessionId);
@@ -677,6 +727,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
 
           this.timeoutTracker.stopTracking(sessionId);
           this.heartbeatTracker.cleanup(sessionId);
+          this.sessionToTaskMap.delete(sessionId);
 
           handle.child = null;
           this.activeWorkers.delete(sessionId);
@@ -941,6 +992,13 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     if (!threadId || threadId.length === 0) {
       return null; // No session to resume — caller falls back to fresh start
     }
+
+    // KNOWN LIMITATION: The Codex CLI `exec resume` does not support targeting a
+    // specific thread/session by ID. `--last` resumes the most recent session,
+    // which may not correspond to the intended task when multiple workers run
+    // concurrently. The threadId is validated for existence above to gate whether
+    // resume is attempted, but the actual resume target is best-effort.
+    // If the Codex CLI adds `--thread-id <id>` support in the future, use it here.
 
     // M-19: Map the configured Claude model tier to a Codex/OpenAI model name
     const codexModel = CODEX_MODEL_MAP[this.modelConfig.worker];

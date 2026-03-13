@@ -466,6 +466,13 @@ export interface ExecutionWorkerManager {
    * Returns null if no thread ID is available for the task.
    */
   getThreadIdForTask?(taskId: string): string | null;
+
+  /**
+   * Terminate a specific worker by session ID.
+   * Sends SIGTERM, waits briefly, then SIGKILL if needed.
+   * Used to kill timed-out or stale workers before resetting their tasks.
+   */
+  terminateWorker?(sessionId: string): Promise<void>;
 }
 
 // ============================================================

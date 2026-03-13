@@ -369,6 +369,26 @@ export class WorkerManager implements ExecutionWorkerManager {
   }
 
   /**
+   * Terminate a specific worker by session ID.
+   * SDK-based workers cannot be force-killed (Agent SDK manages lifecycle),
+   * so this removes the worker from tracking and marks it done.
+   */
+  async terminateWorker(sessionId: string): Promise<void> {
+    const handle = this.activeWorkers.get(sessionId);
+    if (!handle) {
+      return;
+    }
+
+    this.logger.warn(`Terminating worker ${sessionId}`);
+
+    // Clean up tracking state
+    this.timeoutTracker.stopTracking(sessionId);
+    this.heartbeatTracker.cleanup(sessionId);
+    this.activeWorkers.delete(sessionId);
+    await this.updateSessionStatus(sessionId, "done", "Terminated by orchestrator (timed out/stale)");
+  }
+
+  /**
    * Get combined events from all workers (past and present).
    */
   getWorkerEvents(): OrchestratorEvent[] {
