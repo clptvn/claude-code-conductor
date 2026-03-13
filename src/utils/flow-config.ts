@@ -3,6 +3,7 @@ import path from "node:path";
 
 import type { FlowConfig } from "./types.js";
 import { ORCHESTRATOR_DIR } from "./constants.js";
+import type { Logger } from "./logger.js";
 
 // ============================================================
 // Default (generic) flow configuration
@@ -140,14 +141,26 @@ const FLOW_CONFIG_FILENAME = "flow-config.json";
  *
  * User config replaces defaults entirely per top-level key (no deep merge).
  */
-export async function loadFlowConfig(projectDir: string): Promise<FlowConfig> {
+export async function loadFlowConfig(projectDir: string, logger?: Logger): Promise<FlowConfig> {
   const configPath = path.join(projectDir, ORCHESTRATOR_DIR, FLOW_CONFIG_FILENAME);
+  const warn = (msg: string) => logger ? logger.warn(msg) : process.stderr.write(msg + "\n");
 
   try {
     const raw = await fs.readFile(configPath, "utf-8");
-    const parsed = JSON.parse(raw) as Partial<FlowConfig>;
+    const parsed: unknown = JSON.parse(raw);
 
-    // Validate required fields, warn on missing
+    // M-34: Runtime validation — JSON.parse can return any JSON value (null,
+    // array, string, number). Ensure the result is a non-null, non-array object
+    // before treating it as Partial<FlowConfig>.
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      warn(`[flow-config] ${configPath} does not contain a JSON object. Using defaults.`);
+      return DEFAULT_FLOW_CONFIG;
+    }
+
+    const config = parsed as Record<string, unknown>;
+
+    // M-34: Validate that each top-level field is an array if present.
+    // Non-array values would cause runtime errors downstream.
     const requiredKeys: (keyof FlowConfig)[] = [
       "layers",
       "actor_types",
@@ -155,29 +168,30 @@ export async function loadFlowConfig(projectDir: string): Promise<FlowConfig> {
       "example_flows",
     ];
     for (const key of requiredKeys) {
-      if (!(key in parsed)) {
-        // Use process.stderr to avoid mixing with stdout and
-        // to match Logger's output channel (console.warn replaced per M-flow-config)
-        process.stderr.write(
-          `[flow-config] Warning: "${key}" missing from ${configPath}, using default.\n`,
-        );
+      if (key in config) {
+        if (!Array.isArray(config[key])) {
+          warn(`[flow-config] Warning: "${key}" in ${configPath} is not an array, using default.`);
+          delete config[key];
+        }
+      } else {
+        warn(`[flow-config] Warning: "${key}" missing from ${configPath}, using default.`);
       }
     }
 
     // Shallow merge: user-provided keys override defaults entirely
     return {
-      layers: parsed.layers ?? DEFAULT_FLOW_CONFIG.layers,
-      actor_types: parsed.actor_types ?? DEFAULT_FLOW_CONFIG.actor_types,
-      edge_cases: parsed.edge_cases ?? DEFAULT_FLOW_CONFIG.edge_cases,
-      example_flows: parsed.example_flows ?? DEFAULT_FLOW_CONFIG.example_flows,
+      layers: (config.layers as FlowConfig["layers"]) ?? DEFAULT_FLOW_CONFIG.layers,
+      actor_types: (config.actor_types as FlowConfig["actor_types"]) ?? DEFAULT_FLOW_CONFIG.actor_types,
+      edge_cases: (config.edge_cases as FlowConfig["edge_cases"]) ?? DEFAULT_FLOW_CONFIG.edge_cases,
+      example_flows: (config.example_flows as FlowConfig["example_flows"]) ?? DEFAULT_FLOW_CONFIG.example_flows,
     };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       // No config file — use defaults silently
       return DEFAULT_FLOW_CONFIG;
     }
-    process.stderr.write(
-      `[flow-config] Failed to load ${configPath}: ${err instanceof Error ? err.message : String(err)}. Using defaults.\n`,
+    warn(
+      `[flow-config] Failed to load ${configPath}: ${err instanceof Error ? err.message : String(err)}. Using defaults.`,
     );
     return DEFAULT_FLOW_CONFIG;
   }

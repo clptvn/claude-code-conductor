@@ -100,12 +100,15 @@ export class FlowTracer {
     // incrementally so they survive an overall timeout (Issue #5 fix).
     const partialFindings: FlowFinding[] = [];
 
-    // Create timeout promise to enforce 30-minute overall deadline
+    // M-5: Create timeout promise to enforce 30-minute overall deadline.
+    // Store timer reference so we can clearTimeout after the race resolves,
+    // preventing the timer callback from firing after success.
+    let timeoutTimer: ReturnType<typeof setTimeout>;
     const timeoutPromise = new Promise<"timeout">((resolve) => {
-      const timer = setTimeout(() => resolve("timeout"), FLOW_TRACING_OVERALL_TIMEOUT_MS);
+      timeoutTimer = setTimeout(() => resolve("timeout"), FLOW_TRACING_OVERALL_TIMEOUT_MS);
       // Unref timer so it doesn't prevent process exit
-      if (timer.unref) {
-        timer.unref();
+      if (timeoutTimer.unref) {
+        timeoutTimer.unref();
       }
     });
 
@@ -114,6 +117,11 @@ export class FlowTracer {
       tracingPromise.then((findings) => ({ type: "success" as const, findings })),
       timeoutPromise.then(() => ({ type: "timeout" as const })),
     ]);
+
+    // M-5: Clear the timeout timer now that the race has resolved.
+    // Without this, the timer would fire after a successful trace and
+    // resolve the (now unconsumed) timeoutPromise unnecessarily.
+    clearTimeout(timeoutTimer!);
 
     let allFindings: FlowFinding[];
     if (raceResult.type === "timeout") {
@@ -385,14 +393,26 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
         return [parsed as FlowSpec];
       }
 
-      // Validate each flow has required fields
-      return parsed.filter((f: Record<string, unknown>) => {
-        if (!f.id || !f.name || !f.entry_points || !f.actors) {
-          this.logger.warn(`Skipping malformed flow spec: ${JSON.stringify(f).substring(0, 100)}`);
-          return false;
-        }
-        return true;
-      }) as FlowSpec[];
+      // M-4: Validate each flow has required fields with proper type and length checks.
+      // Truthiness alone passes for empty arrays/strings; check types and lengths.
+      return parsed
+        .filter((f: Record<string, unknown>) => {
+          if (
+            typeof f.id !== "string" || !f.id ||
+            typeof f.name !== "string" || !f.name ||
+            !Array.isArray(f.entry_points) || f.entry_points.length === 0 ||
+            !Array.isArray(f.actors) || f.actors.length === 0
+          ) {
+            this.logger.warn(`Skipping malformed flow spec: ${JSON.stringify(f).substring(0, 100)}`);
+            return false;
+          }
+          return true;
+        })
+        .map((f: Record<string, unknown>) => ({
+          ...f,
+          // M-4: Default edge_cases to [] if missing or not an array
+          edge_cases: Array.isArray(f.edge_cases) ? f.edge_cases : [],
+        })) as FlowSpec[];
     } catch (err) {
       this.logger.error(
         `Failed to parse flow specs: ${err instanceof Error ? err.message : String(err)}`,
