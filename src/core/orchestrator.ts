@@ -26,7 +26,8 @@ import type {
   UsageSnapshot,
   WorkerRuntime,
   ProjectProfile,
-
+  DesignSpec,
+  DesignSpecUpdateResult,
 } from "../utils/types.js";
 import { MODEL_TIER_TO_ID, ConductorExitError } from "../utils/types.js";
 
@@ -52,6 +53,9 @@ import {
   getFlowTracingSummaryPath,
   getKnownIssuesPath,
   CODEX_JOB_MAX_RUNTIME_SECONDS,
+  getDesignSpecPath,
+  getFlowConfigPath,
+  getRulesPath,
 } from "../utils/constants.js";
 
 import { Logger } from "../utils/logger.js";
@@ -65,6 +69,8 @@ import { WorkerManager } from "./worker-manager.js";
 import { CodexWorkerManager } from "./codex-worker-manager.js";
 import { FlowTracer } from "./flow-tracer.js";
 import { extractConventions } from "../utils/conventions-extractor.js";
+import { loadDesignSpec } from "../utils/design-spec-analyzer.js";
+import { updateDesignSpec } from "../utils/design-spec-updater.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
 import { addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
 import { ensureGitignore } from "../utils/gitignore.js";
@@ -131,6 +137,9 @@ export class Orchestrator {
 
   // V2: Auto-detected project profile
   private projectProfile: ProjectProfile | null = null;
+
+  // V2: Frontend design spec (from `conduct init`)
+  private designSpec: DesignSpec | undefined = undefined;
 
   // Stores any user redirect guidance gathered during escalation
   private redirectGuidance: string | null = null;
@@ -258,6 +267,9 @@ export class Orchestrator {
         return;
       }
 
+      // Check for init configuration (warn if missing)
+      await this.checkInitStatus();
+
       let planVersion = 1;
       const state = this.state.get();
 
@@ -344,6 +356,9 @@ export class Orchestrator {
         this.projectRules = await loadWorkerRules(this.options.project);
         phaseDurations.conventions_ms = Date.now() - conventionsStart;
 
+        // Load design spec if available (from `conduct init`)
+        this.designSpec = await loadDesignSpec(this.options.project);
+
         // Pass context to worker manager
         this.workers.setWorkerContext({
           qaContext: this.qaContext,
@@ -357,6 +372,8 @@ export class Orchestrator {
           projectGuidance: this.projectProfile
             ? formatProjectGuidance(this.projectProfile)
             : undefined,
+          // V2: Frontend design spec
+          designSpec: this.designSpec,
         });
 
         // Phase 2: Execution
@@ -404,9 +421,10 @@ export class Orchestrator {
         // Use separate start timestamps for accurate per-phase duration tracking
         const reviewStart = Date.now();
         const flowStart = Date.now();
-        const [approved, flowReport] = await Promise.all([
+        const [approved, flowReport, _designSpecUpdate] = await Promise.all([
           this.review().then((r) => { phaseDurations.code_review_ms = Date.now() - reviewStart; return r; }),
           this.flowReview(cycleNum).then((r) => { phaseDurations.flow_tracing_ms = Date.now() - flowStart; return r; }),
+          this.updateDesignSpecIfNeeded(cycleNum),
         ]);
 
 
@@ -919,6 +937,54 @@ export class Orchestrator {
       `before ${phase} (${usageMonitor.getRateSummary()}).`;
     await this.handleProviderRateLimit(provider, detail, usageMonitor.getResetTime());
     return true;
+  }
+
+  // ================================================================
+  // Pre-run init check
+  // ================================================================
+
+  private async checkInitStatus(): Promise<void> {
+    // Skip on resume — user already saw the warning on the initial run
+    if (this.options.resume) return;
+
+    const missing: string[] = [];
+
+    for (const [name, pathFn] of [
+      ["flow-config.json", getFlowConfigPath],
+      ["design-spec.json", getDesignSpecPath],
+      ["rules.md", getRulesPath],
+    ] as const) {
+      try {
+        await fs.access(pathFn(this.options.project));
+      } catch {
+        missing.push(name);
+      }
+    }
+
+    if (missing.length === 0) return;
+
+    console.log(chalk.yellow("\n  ⚠  Init configuration not detected."));
+    console.log(chalk.yellow(`     Missing: ${missing.join(", ")}`));
+    console.log(chalk.yellow("     Running without these files may produce lower quality results."));
+    console.log(chalk.yellow("     Run 'conduct init' to generate project-specific configuration.\n"));
+
+    // Non-interactive mode (CI, piped stdin, headless): just warn and continue
+    if (!process.stdin.isTTY) {
+      this.logger.warn(`Init configuration missing (${missing.join(", ")}); continuing in non-interactive mode.`);
+      return;
+    }
+
+    // Interactive prompt: continue or cancel?
+    const rl = readline.createInterface({ input, output });
+    try {
+      const answer = await rl.question(chalk.white("  Continue without init configuration? (y/n): "));
+      if (answer.trim().toLowerCase() !== "y" && answer.trim().toLowerCase() !== "yes") {
+        console.log(chalk.cyan("\n  Run 'conduct init' to set up your project, then try again.\n"));
+        throw new ConductorExitError(0, "User cancelled — init configuration missing.");
+      }
+    } finally {
+      rl.close();
+    }
   }
 
   // ================================================================
@@ -1840,6 +1906,77 @@ export class Orchestrator {
         `Flow-tracing failed: ${err instanceof Error ? err.message : String(err)}`,
       );
       recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
+      return null;
+    }
+  }
+
+  // ================================================================
+  // Design Spec Update (runs in parallel with review + flow-trace)
+  // ================================================================
+
+  private async updateDesignSpecIfNeeded(cycle: number): Promise<DesignSpecUpdateResult | null> {
+    // Skip if disabled or no design spec exists
+    if (this.options.skipDesignSpecUpdate || !this.designSpec) {
+      return null;
+    }
+
+    // Get changed files from completed tasks
+    let changedFiles: string[];
+    try {
+      changedFiles = await this.git.getChangedFiles(this.baseBranch);
+    } catch {
+      return null;
+    }
+
+    if (changedFiles.length === 0) {
+      return null;
+    }
+
+    const workerModelId = MODEL_TIER_TO_ID[this.options.modelConfig.worker];
+
+    try {
+      this.logger.info("Updating design spec from cycle changes...");
+      const result = await updateDesignSpec(
+        this.options.project,
+        changedFiles,
+        this.designSpec,
+        workerModelId,
+        this.logger,
+      );
+
+      if (result.updated) {
+        this.logger.info("Design spec updated with changes from this cycle.");
+        // Reload the spec so next cycle's workers see the update
+        this.designSpec = await loadDesignSpec(this.options.project);
+      }
+
+      // Log warnings (e.g., shared component base styles modified)
+      for (const warning of result.warnings) {
+        this.logger.warn(`Design spec warning: ${warning}`);
+      }
+
+      // Add base-style-modification warnings as known issues
+      const baseStyleWarnings = result.warnings.filter((w) =>
+        w.toLowerCase().includes("base style") || w.toLowerCase().includes("base styles"),
+      );
+      if (baseStyleWarnings.length > 0) {
+        await addKnownIssues(
+          this.options.project,
+          baseStyleWarnings.map((w) => ({
+            description: w,
+            severity: "high" as const,
+            source: "flow_tracing" as const, // closest existing source type
+            found_in_cycle: cycle,
+          })),
+          this.logger,
+        );
+      }
+
+      return result;
+    } catch (err) {
+      this.logger.warn(
+        `Design spec update failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
       return null;
     }
   }
