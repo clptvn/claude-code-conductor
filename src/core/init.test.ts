@@ -32,6 +32,10 @@ vi.mock("../utils/flow-config-generator.js", () => ({
   generateFlowConfig: vi.fn(),
 }));
 
+vi.mock("../utils/rules-extractor.js", () => ({
+  extractProjectRules: vi.fn(),
+}));
+
 vi.mock("../utils/gitignore.js", () => ({
   ensureGitignore: vi.fn(),
 }));
@@ -51,6 +55,7 @@ import { runInit } from "./init.js";
 import { detectProjectWithCache } from "./project-detector.js";
 import { analyzeDesignSystem } from "../utils/design-spec-analyzer.js";
 import { generateFlowConfig } from "../utils/flow-config-generator.js";
+import { extractProjectRules } from "../utils/rules-extractor.js";
 import { ensureGitignore } from "../utils/gitignore.js";
 import { DEFAULT_FLOW_CONFIG } from "../utils/flow-config.js";
 
@@ -142,6 +147,7 @@ describe("runInit", () => {
     vi.mocked(detectProjectWithCache).mockResolvedValue(MOCK_PROFILE_FRONTEND);
     vi.mocked(generateFlowConfig).mockReturnValue(MOCK_FLOW_CONFIG);
     vi.mocked(analyzeDesignSystem).mockResolvedValue(MOCK_DESIGN_SPEC);
+    vi.mocked(extractProjectRules).mockResolvedValue("# Conductor Worker Rules\n\n## Architecture Rules\n- Use secureHandler for all API routes\n");
     vi.mocked(ensureGitignore).mockResolvedValue();
 
     // Suppress console.log noise
@@ -182,7 +188,7 @@ describe("runInit", () => {
       const content = await fs.readFile(rulesPath, "utf-8");
       expect(content).toContain("Conductor Worker Rules");
       expect(content).toContain("Architecture Rules");
-      expect(content).toContain("Off-Limits");
+      expect(content).toContain("secureHandler"); // from mock extractProjectRules
     });
 
     it("returns correct InitResult structure", async () => {
